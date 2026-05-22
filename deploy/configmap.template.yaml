@@ -1,0 +1,45 @@
+# ConfigMap Template — replace <PLACEHOLDERS> before applying
+# Real config with git tokens goes here (NOT in git repo)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deepinsight-config
+  namespace: rag-etl
+data:
+  project.yml: |
+    project:
+      name: "<PROJECT_NAME>"
+      description: "<PROJECT_DESCRIPTION>"
+
+    repos:
+      - name: "<REPO_1_NAME>"
+        url: "<GIT_URL_WITH_AUTH>"
+        branch: master
+        language: python
+        role: entry_point
+
+      # ... add more repos
+
+    llm:
+      analysis:
+        base_url: "<LLM_BASE_URL>"
+        api_key_env: "LLM_ANALYSIS_API_KEY"
+        model: "deepseek-v4-pro"
+      utility:
+        base_url: "<LLM_BASE_URL>"
+        api_key_env: "LLM_UTILITY_API_KEY"
+        model: "deepseek-v4-pro"
+
+    risk_patterns:
+      high_risk_dirs:
+        - "*/auth/*"
+        - "*/payment/*"
+        - "*/security/*"
+      api_dirs:
+        - "*/api/*"
+        - "*/views/*"
+
+    output:
+      include_test_plan: true
+      call_tree_depth: 2
+      language: "zh-CN"

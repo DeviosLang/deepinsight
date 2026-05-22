@@ -1,0 +1,100 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepinsight-server
+  namespace: rag-etl
+  labels:
+    app: deepinsight-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepinsight-server
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: deepinsight-server
+    spec:
+      containers:
+        - name: server
+          image: mirrors.tencent.com/cvm/deepinsight:latest
+          imagePullPolicy: Always
+          command: ["node", "packages/analysis-service/dist/index.js"]
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: PORT
+              value: "8080"
+            - name: NODE_ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: WORKSPACE_DIR
+              value: "/data/workspace"
+            - name: SCRATCH_DIR
+              value: "/data/scratch"
+            - name: PROJECT_CONFIG_PATH
+              value: "/etc/deepinsight/project.yml"
+            # LLM credentials from Secret
+            - name: LLM_ANALYSIS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: llm-api-key
+            - name: LLM_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: llm-base-url
+            - name: LLM_MODEL
+              value: "deepseek-v4-pro"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "4"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/workspace
+            - name: scratch
+              mountPath: /data/scratch
+            - name: config
+              mountPath: /etc/deepinsight
+              readOnly: true
+      imagePullSecrets:
+        - name: memorix-base
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: shirakami-workspace-nfs
+        - name: scratch
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: config
+          configMap:
+            name: deepinsight-config

@@ -1,0 +1,19 @@
+{
+  "name": "@deepinsight/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./risk": "./src/risk/index.ts",
+    "./merger": "./src/merger/index.ts",
+    "./types": "./src/types/index.ts"
+  },
+  "scripts": {
+    "build": "tsc --build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist *.tsbuildinfo"
+  }
+}

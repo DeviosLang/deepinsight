@@ -1,0 +1,144 @@
+# Project Config Template
+# Copy to your K8s ConfigMap or local .env, replace placeholders with real values.
+# DO NOT commit real credentials to git.
+
+project:
+  name: "cloud-platform"
+  description: "Cloud virtual machine management platform"
+
+# ── Repository List ──
+# Replace URLs with your actual git remote URLs (include auth tokens in K8s Secret)
+repos:
+  - name: "platform-api"
+    url: "<GIT_BASE_URL>/platform/api.git"
+    branch: master
+    language: python
+    role: entry_point
+    tags: ["api", "public-facing"]
+
+  - name: "platform-console"
+    url: "<GIT_BASE_URL>/platform/console-api.git"
+    branch: master
+    language: python
+    role: entry_point
+    tags: ["api", "public-facing"]
+
+  - name: "compute-service"
+    url: "<GIT_BASE_URL>/compute/service.git"
+    branch: master
+    language: python
+    role: core
+    tags: ["compute"]
+
+  - name: "compute-framework"
+    url: "<GIT_BASE_URL>/compute/framework.git"
+    branch: master
+    language: python
+    role: shared_lib
+    tags: ["framework", "shared"]
+
+  - name: "platform-db"
+    url: "<GIT_BASE_URL>/platform/database.git"
+    branch: master
+    language: python
+    role: core
+    tags: ["database", "storage"]
+
+  - name: "scheduler-service"
+    url: "<GIT_BASE_URL>/platform/scheduler.git"
+    branch: master
+    language: python
+    role: service
+    tags: ["scheduler"]
+
+  - name: "gateway-service"
+    url: "<GIT_BASE_URL>/platform/gateway.git"
+    branch: master
+    language: python
+    role: service
+    tags: ["gateway", "auth"]
+
+# ── Knowledge Base (optional) ──
+knowledge_base:
+  repo: "<GIT_BASE_URL>/platform/ai-docs.git"
+  paths:
+    - "architecture/"
+    - "service-topology.md"
+
+# ── Internal Package Mapping ──
+internal_packages:
+  prefixes:
+    - prefix: "platform_"
+      repos: ["platform-api", "platform-console", "platform-db"]
+    - prefix: "compute_"
+      repos: ["compute-service", "compute-framework"]
+  explicit:
+    - package: "common_utils"
+      repo: "compute-framework"
+    - package: "gateway_client"
+      repo: "gateway-service"
+
+# ── Risk Patterns ──
+risk_patterns:
+  high_risk_dirs:
+    - "*/auth/*"
+    - "*/payment/*"
+    - "*/security/*"
+    - "*/billing/*"
+    - "*/keypair/*"
+  api_dirs:
+    - "*/api/*"
+    - "*/views/*"
+    - "*/routes/*"
+    - "*/controllers/*"
+
+# ── Runtime Call Detection ──
+runtime_calls:
+  http:
+    framework_patterns:
+      - "ServiceClient"
+      - "api_client"
+      - "requests.get"
+      - "requests.post"
+      - "httpx.AsyncClient"
+    route_patterns:
+      - "@app.route"
+      - "@router."
+      - "urlpatterns"
+      - "path("
+  mq:
+    type: "rabbitmq"
+    library: "pika"
+    producer_patterns:
+      - "basic_publish"
+      - "channel.publish"
+      - "send_message"
+    consumer_patterns:
+      - "basic_consume"
+      - "queue_bind"
+      - "on_message"
+    naming_convention: "{service}.{entity}.{action}"
+
+# ── LLM Configuration ──
+# API keys should be injected via K8s Secret → env var, not hardcoded here.
+llm:
+  analysis:
+    base_url: "<LLM_BASE_URL>"
+    api_key_env: "LLM_ANALYSIS_API_KEY"
+    model: "deepseek-v4-pro"
+  utility:
+    base_url: "<LLM_BASE_URL>"
+    api_key_env: "LLM_UTILITY_API_KEY"
+    model: "deepseek-v4-pro"
+
+# ── Output Configuration ──
+output:
+  include_test_plan: true
+  include_oracle: true
+  call_tree_depth: 2
+  language: "zh-CN"
+
+# ── Analysis Mode ──
+# accuracy_first: multi-round verification, cross-validation (higher cost)
+# budget_balanced: single-round, skip cross-validation (lower cost)
+analysis_mode: accuracy_first

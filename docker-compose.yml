@@ -1,0 +1,31 @@
+# Local development environment
+# Usage: docker compose up
+
+services:
+  deepinsight:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - NODE_ENV=development
+      - PORT=8080
+      - LOG_LEVEL=debug
+      - WORKSPACE_DIR=/data/workspace
+      - SCRATCH_DIR=/data/scratch
+      - PROJECT_CONFIG_PATH=/etc/deepinsight/project.yml
+      - LLM_ANALYSIS_API_KEY=${LLM_API_KEY:-changeme}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://localhost:11434/v1}
+      - LLM_MODEL=${LLM_MODEL:-deepseek-v4-pro}
+    volumes:
+      # Mount local repos for testing
+      - ./test/fixtures/repos:/data/workspace
+      - deepinsight-scratch:/data/scratch
+      - ./config/projects/example.template.yml:/etc/deepinsight/project.yml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  deepinsight-scratch:

@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepinsight-server
+  namespace: rag-etl
+  labels:
+    app: deepinsight-server
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: deepinsight-server

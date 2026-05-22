@@ -1,0 +1,27 @@
+{
+  "name": "deepinsight",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-repo impact analysis system",
+  "scripts": {
+    "dev": "pnpm --filter @deepinsight/analysis-service dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "test:coverage": "pnpm -r test -- --coverage",
+    "lint": "biome check .",
+    "lint:fix": "biome check --fix .",
+    "format": "biome format --write .",
+    "typecheck": "pnpm -r typecheck",
+    "precheck": "pnpm typecheck && pnpm lint && pnpm test",
+    "clean": "pnpm -r clean && rm -rf node_modules"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
