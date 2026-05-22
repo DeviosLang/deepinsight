@@ -1,5 +1,12 @@
 /**
- * Repository Manager — git bare repos + per-task worktree management
+ * Repository Manager — manages access to git repos on NFS + temp worktrees on local storage.
+ *
+ * NFS layout (shirakami-workspace):
+ *   /data/workspace/{repoName}/          ← full clone with .git
+ *   /data/workspace/{repoName}/.git/
+ *
+ * Local scratch (emptyDir SSD):
+ *   /data/scratch/{taskId}/{repoName}/   ← temporary worktree for ast-grep
  */
 
 import { execFileSync, spawnSync } from "node:child_process";
@@ -8,7 +15,7 @@ import * as path from "node:path";
 import type { RepoConfig } from "@deepinsight/core";
 
 export interface RepoManagerConfig {
-  /** Base directory for repo data (NFS mount) */
+  /** Base directory for repo data (NFS mount with full clones) */
   workspaceDir: string;
   /** Local fast storage for temporary worktrees (emptyDir) */
   scratchDir: string;
@@ -18,15 +25,15 @@ export class RepoManager {
   private readonly workspaceDir: string;
   private readonly scratchDir: string;
 
-  constructor(config: RepoManagerConfig) {
-    this.workspaceDir = config.workspaceDir;
-    this.scratchDir = config.scratchDir;
+  constructor(config?: Partial<RepoManagerConfig>) {
+    this.workspaceDir = config?.workspaceDir ?? process.env.WORKSPACE_DIR ?? "/data/workspace";
+    this.scratchDir = config?.scratchDir ?? process.env.SCRATCH_DIR ?? "/data/scratch";
     fs.mkdirSync(this.scratchDir, { recursive: true });
   }
 
   /**
    * Get path to a repo in the workspace (NFS).
-   * Repos are expected to be full clones at /workspace/{repoName}/
+   * Repos are full clones at /workspace/{repoName}/
    */
   getRepoPath(repoName: string): string {
     return path.join(this.workspaceDir, repoName);
@@ -41,11 +48,26 @@ export class RepoManager {
   }
 
   /**
-   * Run git grep on a repo (works on NFS — sequential reads are OK).
+   * List all available repos in the workspace.
+   */
+  listRepos(): string[] {
+    try {
+      return fs
+        .readdirSync(this.workspaceDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && fs.existsSync(path.join(this.workspaceDir, d.name, ".git")))
+        .map((d) => d.name);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Run git grep on a repo (works on NFS — sequential reads are tolerable).
+   * Searches the working tree (HEAD) for the given pattern.
    */
   gitGrep(repoName: string, pattern: string, pathSpec?: string[]): string[] {
     const repoPath = this.getRepoPath(repoName);
-    const args = ["grep", "-l", pattern, "HEAD"];
+    const args = ["grep", "-l", "--", pattern];
     if (pathSpec?.length) {
       args.push("--", ...pathSpec);
     }
@@ -58,6 +80,33 @@ export class RepoManager {
 
     if (result.status !== 0) return []; // No matches or error
     return result.stdout.trim().split("\n").filter(Boolean);
+  }
+
+  /**
+   * Get the current HEAD commit hash for a repo.
+   */
+  getHeadCommit(repoName: string): string | null {
+    const repoPath = this.getRepoPath(repoName);
+    const result = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoPath,
+      timeout: 5_000,
+      encoding: "utf-8",
+    });
+    if (result.status !== 0) return null;
+    return result.stdout.trim();
+  }
+
+  /**
+   * Get diff between two refs (or working tree changes).
+   */
+  getDiff(repoName: string, base = "HEAD~1", head = "HEAD"): string {
+    const repoPath = this.getRepoPath(repoName);
+    const result = spawnSync("git", ["diff", base, head], {
+      cwd: repoPath,
+      timeout: 30_000,
+      encoding: "utf-8",
+    });
+    return result.stdout ?? "";
   }
 
   /**
@@ -112,6 +161,19 @@ export class RepoManager {
       return await fn(wtPath);
     } finally {
       this.removeWorktree(taskId, repoName);
+    }
+  }
+
+  /**
+   * Clean up all worktrees for a given task (e.g., on timeout or error).
+   */
+  cleanupTask(taskId: string): void {
+    const taskDir = path.join(this.scratchDir, taskId);
+    if (!fs.existsSync(taskDir)) return;
+
+    const repos = fs.readdirSync(taskDir);
+    for (const repo of repos) {
+      this.removeWorktree(taskId, repo);
     }
   }
 }

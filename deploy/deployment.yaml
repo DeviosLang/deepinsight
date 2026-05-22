@@ -60,24 +60,26 @@ spec:
           resources:
             requests:
               cpu: "500m"
-              memory: "1Gi"
+              memory: "2Gi"
             limits:
               cpu: "4"
-              memory: "4Gi"
+              memory: "16Gi"
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8080
             initialDelaySeconds: 10
-            periodSeconds: 30
-            failureThreshold: 3
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
           readinessProbe:
             httpGet:
               path: /readyz
               port: 8080
             initialDelaySeconds: 5
-            periodSeconds: 10
-            failureThreshold: 2
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           volumeMounts:
             - name: workspace
               mountPath: /data/workspace

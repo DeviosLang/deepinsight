@@ -51,6 +51,10 @@ COPY --from=builder /app/packages/analysis-service/node_modules/ ./packages/anal
 # Copy pi skill files
 COPY packages/pi-skill/ ./packages/pi-skill/
 
+# Configure pi agent custom provider
+RUN mkdir -p /root/.pi/agent
+COPY config/pi-models.json /root/.pi/agent/models.json
+
 # Runtime config
 ENV NODE_ENV=production
 ENV PORT=8080

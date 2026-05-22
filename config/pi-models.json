@@ -1,0 +1,22 @@
+{
+  "providers": {
+    "tokenhub": {
+      "baseUrl": "https://tokenhub.tencentmaas.com/plan/v3",
+      "api": "openai-completions",
+      "apiKey": "placeholder-overridden-by-cli-flag",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [
+        {
+          "id": "deepseek-v4-pro",
+          "name": "DeepSeek V4 Pro (TokenHub)",
+          "reasoning": true,
+          "contextWindow": 65536,
+          "maxOutputTokens": 8192
+        }
+      ]
+    }
+  }
+}

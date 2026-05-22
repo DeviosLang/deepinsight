@@ -4,6 +4,7 @@
 
 import type { FastifyInstance } from "fastify";
 import type { AnalysisTask, ChangeSpec, AnalysisOptions } from "@deepinsight/core";
+import { runAnalysisPipeline, loadPipelineConfig } from "../orchestrator/pipeline.js";
 
 // In-memory task store (Phase 1a: replace with persistent store later)
 const tasks = new Map<string, AnalysisTask>();
@@ -15,6 +16,8 @@ interface AnalyzeBody {
 }
 
 export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
+  const pipelineConfig = loadPipelineConfig();
+
   // Submit analysis task
   app.post<{ Body: AnalyzeBody }>("/analyze", async (req, reply) => {
     const { project, changes, options } = req.body;
@@ -36,9 +39,8 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
 
     tasks.set(taskId, task);
 
-    // TODO: Phase 1a — synchronous execution
-    // TODO: Phase 1b — async queue + background processing
-    startAnalysis(task).catch((err) => {
+    // Phase 1a: run analysis in background (fire-and-forget)
+    startAnalysis(task, pipelineConfig).catch((err) => {
       app.log.error({ taskId, err }, "Analysis failed");
       task.status = "failed";
       task.error = err instanceof Error ? err.message : String(err);
@@ -83,21 +85,23 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
 }
 
 /**
- * Execute analysis (Phase 1a: synchronous, single worker)
+ * Execute analysis pipeline.
  */
-async function startAnalysis(task: AnalysisTask): Promise<void> {
+async function startAnalysis(task: AnalysisTask, pipelineConfig: ReturnType<typeof loadPipelineConfig>): Promise<void> {
   task.status = "running";
   task.progress = { step: 0, stepName: "初始化", reposScanned: 0, reposTotal: 0 };
 
-  // TODO: Implement analysis pipeline
-  // 1. Load project config
-  // 2. Fetch diff from git
-  // 3. Pre-filter (coarse + fine)
-  // 4. Spawn pi worker(s)
-  // 5. Merge results
-  // 6. Return report
+  const result = await runAnalysisPipeline(task, pipelineConfig);
 
-  // Placeholder: mark completed after setup
-  task.status = "completed";
+  if (result) {
+    task.result = result;
+    task.status = "completed";
+  } else if (!task.error) {
+    task.status = "failed";
+    task.error = "Analysis returned no result";
+  } else {
+    task.status = "failed";
+  }
+
   task.completedAt = new Date().toISOString();
 }
