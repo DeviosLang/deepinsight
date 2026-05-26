@@ -161,6 +161,35 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
     task.error = "Cancelled by user";
     return { taskId, status: "cancelled" };
   });
+
+  // List all tasks (summary view, no full result payload)
+  app.get("/tasks", async (req, reply) => {
+    const query = req.query as Record<string, string>;
+    const limit = Math.min(Number(query.limit) || 50, 200);
+    const status = query.status; // optional filter: queued|running|completed|failed
+
+    const allTasks = [...tasks.values()]
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      .filter((t) => !status || t.status === status)
+      .slice(0, limit);
+
+    return {
+      total: tasks.size,
+      returned: allTasks.length,
+      tasks: allTasks.map((t) => ({
+        taskId: t.taskId,
+        project: t.project,
+        status: t.status,
+        changes: t.changes,
+        createdAt: t.createdAt,
+        completedAt: t.completedAt,
+        error: t.error,
+        progress: t.progress,
+        // Omit full result to keep response lightweight
+        hasResult: !!t.result,
+      })),
+    };
+  });
 }
 
 /**

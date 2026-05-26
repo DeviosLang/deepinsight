@@ -120,6 +120,21 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
       console.log(`[pi:rpc] Sent prompt command via stdin (${promptCommand.length} chars)`);
     };
 
+    // Steer timer: send "wrap up" message before timeout to ensure pi outputs final report
+    const steerDelayMs = Math.max(timeoutMs - 100_000, timeoutMs * 0.85); // 100s before timeout, or 85% of timeout
+    const steerTimer = setTimeout(() => {
+      if (resolved) return;
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[pi:steer +${elapsed}s] Sending wrap-up steer message (${Math.round((timeoutMs - steerDelayMs) / 1000)}s before timeout)`);
+      try {
+        const steerCmd = JSON.stringify({
+          type: "steer",
+          message: "时间即将用完。请立即停止搜索，基于已收集到的信息输出最终 JSON 报告。用 ```json ... ``` 包裹。",
+        });
+        proc.stdin?.write(steerCmd + "\n");
+      } catch {}
+    }, steerDelayMs);
+
     // Timeout handler: send abort then force kill
     const timeoutHandle = setTimeout(() => {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -274,6 +289,7 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
     proc.on("close", (code) => {
       resolved = true;
       clearTimeout(timeoutHandle);
+      clearTimeout(steerTimer);
       if (killTimer) clearTimeout(killTimer);
       clearInterval(watchdog);
       const durationMs = Date.now() - startTime;
@@ -297,6 +313,7 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
     proc.on("error", (err) => {
       resolved = true;
       clearTimeout(timeoutHandle);
+      clearTimeout(steerTimer);
       if (killTimer) clearTimeout(killTimer);
       clearInterval(watchdog);
       const durationMs = Date.now() - startTime;
