@@ -9,6 +9,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import YAML from "yaml";
 import type { AnalysisTask, AnalysisResult, ChangeSpec } from "@deepinsight/core";
 import { RepoManager } from "../repo/repoManager.js";
 import { coarseFilter } from "../pre-filter/index.js";
@@ -38,29 +39,24 @@ export interface PipelineConfig {
  * Load pipeline config from environment variables and project config.
  */
 export function loadPipelineConfig(): PipelineConfig {
-  // Load project.yml for filter config
   const projectConfigPath = process.env.PROJECT_CONFIG_PATH ?? "/etc/deepinsight/project.yml";
   let excludeDirs: string[] = [];
   let entryPointRepos: string[] = [];
 
   try {
-    const yaml = fs.readFileSync(projectConfigPath, "utf-8");
-    // Simple YAML parsing for exclude_dirs list
-    const filterMatch = yaml.match(/filter:\s*\n\s*exclude_dirs:\s*\n((?:\s*-\s*.+\n?)*)/);
-    if (filterMatch) {
-      excludeDirs = filterMatch[1]
-        .split("\n")
-        .map((line) => line.replace(/^\s*-\s*/, "").trim().replace(/["']/g, ""))
-        .filter(Boolean);
+    const rawYaml = fs.readFileSync(projectConfigPath, "utf-8");
+    const config = YAML.parse(rawYaml) as Record<string, unknown>;
+
+    // Parse filter.exclude_dirs
+    const filter = config.filter as Record<string, unknown> | undefined;
+    if (filter && Array.isArray(filter.exclude_dirs)) {
+      excludeDirs = filter.exclude_dirs.map(String);
     }
 
-    // Parse repos.entry_points list
-    const entryMatch = yaml.match(/repos:\s*\n\s*entry_points:\s*\n((?:\s*-\s*.+\n?)*)/);
-    if (entryMatch) {
-      entryPointRepos = entryMatch[1]
-        .split("\n")
-        .map((line) => line.replace(/^\s*-\s*/, "").trim().replace(/["']/g, ""))
-        .filter(Boolean);
+    // Parse repos.entry_points
+    const repos = config.repos as Record<string, unknown> | undefined;
+    if (repos && Array.isArray(repos.entry_points)) {
+      entryPointRepos = repos.entry_points.map(String);
     }
   } catch {
     // No project config or parse error — use defaults
@@ -221,11 +217,21 @@ export async function runAnalysisPipeline(
     })),
     untrackable: [],
     globalPatternsMatched: [],
-    _rawOutput: piResult.output, // Include raw for debugging
+    _rawOutput: truncateRawOutput(piResult.output), // Truncated for storage efficiency
   } as unknown as AnalysisResult;
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Truncate raw pi output for storage — keep only the last 4KB
+ * (the final assistant message with analysis content, not the thinking process).
+ */
+function truncateRawOutput(output: string): string {
+  const MAX_RAW_LENGTH = 4096;
+  if (output.length <= MAX_RAW_LENGTH) return output;
+  return "...(truncated)...\n" + output.slice(-MAX_RAW_LENGTH);
+}
 
 function getDiff(repoManager: RepoManager, change: ChangeSpec, excludeDirs?: string[]): string | null {
   if (!repoManager.repoExists(change.repo)) return null;
