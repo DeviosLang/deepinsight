@@ -9,7 +9,7 @@
  *   /data/scratch/{taskId}/{repoName}/   ← temporary worktree for ast-grep
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawnSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RepoConfig } from "@deepinsight/core";
@@ -83,6 +83,33 @@ export class RepoManager {
   }
 
   /**
+   * Async version of gitGrep — runs in background, returns a Promise.
+   * Used for parallel grep across multiple repos.
+   */
+  gitGrepAsync(repoName: string, pattern: string, pathSpec?: string[]): Promise<string[]> {
+    const repoPath = this.getRepoPath(repoName);
+    const args = ["grep", "-l", "--", pattern];
+    if (pathSpec?.length) {
+      args.push("--", ...pathSpec);
+    }
+
+    return new Promise((resolve) => {
+      const proc = spawn("git", args, {
+        cwd: repoPath,
+        timeout: 30_000,
+      });
+
+      let stdout = "";
+      proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.on("close", (code) => {
+        if (code !== 0) return resolve([]);
+        resolve(stdout.trim().split("\n").filter(Boolean));
+      });
+      proc.on("error", () => resolve([]));
+    });
+  }
+
+  /**
    * Get the current HEAD commit hash for a repo.
    */
   getHeadCommit(repoName: string): string | null {
@@ -94,6 +121,27 @@ export class RepoManager {
     });
     if (result.status !== 0) return null;
     return result.stdout.trim();
+  }
+
+  /**
+   * Get diff between two refs, excluding specified directories.
+   * Uses git pathspec exclusion syntax: ':!path/'
+   */
+  getDiffWithExcludes(repoName: string, base = "HEAD~1", head = "HEAD", excludeDirs: string[]): string {
+    const repoPath = this.getRepoPath(repoName);
+    const args = ["diff", base, head, "--"];
+
+    // Add pathspec exclusions: ':!tests/' ':!test/' etc.
+    for (const dir of excludeDirs) {
+      args.push(`:!${dir}`);
+    }
+
+    const result = spawnSync("git", args, {
+      cwd: repoPath,
+      timeout: 30_000,
+      encoding: "utf-8",
+    });
+    return result.stdout ?? "";
   }
 
   /**

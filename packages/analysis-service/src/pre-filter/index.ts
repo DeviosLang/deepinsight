@@ -26,71 +26,101 @@ export interface PreFilterResult {
 
 /**
  * Phase 1: Coarse filter using git grep on NFS (no worktree needed).
- * Covers 5 layers: direct symbol + HTTP endpoint + MQ topic + config ref + reverse dep.
+ * Runs all repos IN PARALLEL for speed. Each repo's symbols are checked sequentially.
+ * Returns top MAX_TARGET_REPOS repos sorted by hit count.
  */
-export function coarseFilter(
+export async function coarseFilter(
   symbols: Symbol[],
   allRepos: string[],
   repoManager: RepoManager,
-): Set<string> {
-  const hits = new Set<string>();
+): Promise<Set<string>> {
+  // Filter symbols first — skip generic names
+  const filteredSymbols = symbols.filter(
+    (s) => s.name.length >= 4 && !GENERIC_NAMES.has(s.name),
+  );
 
-  for (const repo of allRepos) {
-    if (!repoManager.repoExists(repo)) continue;
+  // Run all repos in parallel (limited concurrency to avoid NFS overload)
+  const CONCURRENCY = 10;
+  const hitCounts = new Map<string, number>();
 
-    for (const symbol of symbols) {
-      // Layer 1: Direct symbol name
-      const symHits = repoManager.gitGrep(repo, symbol.name);
-      if (symHits.length > 0) {
-        hits.add(repo);
-        break;
-      }
+  for (let i = 0; i < allRepos.length; i += CONCURRENCY) {
+    const batch = allRepos.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(
+      batch.map(async (repo) => {
+        if (!repoManager.repoExists(repo)) return { repo, count: 0 };
 
-      // Layer 2: HTTP endpoint URL
-      if (symbol.endpointUrl) {
-        const httpHits = repoManager.gitGrep(repo, symbol.endpointUrl);
-        if (httpHits.length > 0) {
-          hits.add(repo);
-          break;
+        let count = 0;
+        for (const symbol of filteredSymbols) {
+          // Layer 1: Direct symbol name
+          const symHits = await repoManager.gitGrepAsync(repo, symbol.name);
+          if (symHits.length > 0) {
+            count++;
+            continue;
+          }
+
+          // Layer 2: HTTP endpoint URL
+          if (symbol.endpointUrl) {
+            const httpHits = await repoManager.gitGrepAsync(repo, symbol.endpointUrl);
+            if (httpHits.length > 0) {
+              count++;
+              continue;
+            }
+          }
+
+          // Layer 3: MQ topic
+          if (symbol.eventTopic) {
+            const mqHits = await repoManager.gitGrepAsync(repo, symbol.eventTopic);
+            if (mqHits.length > 0) {
+              count++;
+              continue;
+            }
+          }
+
+          // Layer 4: Config reference (YAML/JSON)
+          if (symbol.fullyQualifiedName) {
+            const cfgHits = await repoManager.gitGrepAsync(repo, symbol.fullyQualifiedName);
+            if (cfgHits.length > 0) {
+              count++;
+              continue;
+            }
+          }
+
+          // Layer 5: Reverse dependency (who imports the package)
+          if (symbol.packageName) {
+            const importHits = await repoManager.gitGrepAsync(repo, symbol.packageName);
+            if (importHits.length > 0) {
+              count++;
+              continue;
+            }
+          }
         }
-      }
 
-      // Layer 3: MQ topic
-      if (symbol.eventTopic) {
-        const mqHits = repoManager.gitGrep(repo, symbol.eventTopic);
-        if (mqHits.length > 0) {
-          hits.add(repo);
-          break;
-        }
-      }
+        return { repo, count };
+      }),
+    );
 
-      // Layer 4: Config reference (YAML/JSON)
-      if (symbol.fullyQualifiedName) {
-        const cfgHits = repoManager.gitGrep(repo, symbol.fullyQualifiedName, [
-          "*.yaml",
-          "*.yml",
-          "*.json",
-          "*.toml",
-        ]);
-        if (cfgHits.length > 0) {
-          hits.add(repo);
-          break;
-        }
-      }
-
-      // Layer 5: Reverse dependency (who imports the package)
-      if (symbol.packageName) {
-        const importHits = repoManager.gitGrep(repo, symbol.packageName);
-        if (importHits.length > 0) {
-          hits.add(repo);
-          break;
-        }
-      }
+    for (const { repo, count } of results) {
+      if (count > 0) hitCounts.set(repo, count);
     }
   }
 
-  return hits;
+  // Sort by hit count descending, take top MAX_TARGET_REPOS
+  const sorted = [...hitCounts.entries()].sort((a, b) => b[1] - a[1]);
+  const topRepos = sorted.slice(0, MAX_TARGET_REPOS);
+
+  console.log(`[pre-filter] ${hitCounts.size} repos hit, top ${topRepos.length}: ${topRepos.map(([r, c]) => `${r}(${c})`).join(', ')}`);
+
+  return new Set(topRepos.map(([r]) => r));
 }
+
+/** Max repos to pass to pi for detailed analysis */
+const MAX_TARGET_REPOS = 10;
+
+/** Symbol names too generic for grep (would match everything) */
+const GENERIC_NAMES = new Set([
+  "check", "get", "set", "run", "main", "init", "test", "setup",
+  "update", "delete", "create", "read", "write", "open", "close",
+]);
 
 /**
  * Phase 2: Fine filter using ast-grep on local worktrees.
@@ -145,7 +175,7 @@ export async function preFilter(
   taskId: string,
   repoManager: RepoManager,
 ): Promise<PreFilterResult> {
-  const coarseHits = coarseFilter(symbols, allRepos, repoManager);
+  const coarseHits = await coarseFilter(symbols, allRepos, repoManager);
   const fineHits = await fineFilter(symbols, coarseHits, taskId, repoManager);
 
   return { symbols, coarseHits, fineHits };

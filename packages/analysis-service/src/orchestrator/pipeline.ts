@@ -28,12 +28,49 @@ export interface PipelineConfig {
   };
   /** Repos to analyze against (if empty, scans all available) */
   targetRepos?: string[];
+  /** Directory patterns to exclude from diff (e.g., test directories) */
+  excludeDirs?: string[];
+  /** Entry point repos — always included in analysis regardless of grep hits */
+  entryPointRepos?: string[];
 }
 
 /**
  * Load pipeline config from environment variables and project config.
  */
 export function loadPipelineConfig(): PipelineConfig {
+  // Load project.yml for filter config
+  const projectConfigPath = process.env.PROJECT_CONFIG_PATH ?? "/etc/deepinsight/project.yml";
+  let excludeDirs: string[] = [];
+  let entryPointRepos: string[] = [];
+
+  try {
+    const yaml = fs.readFileSync(projectConfigPath, "utf-8");
+    // Simple YAML parsing for exclude_dirs list
+    const filterMatch = yaml.match(/filter:\s*\n\s*exclude_dirs:\s*\n((?:\s*-\s*.+\n?)*)/);
+    if (filterMatch) {
+      excludeDirs = filterMatch[1]
+        .split("\n")
+        .map((line) => line.replace(/^\s*-\s*/, "").trim().replace(/["']/g, ""))
+        .filter(Boolean);
+    }
+
+    // Parse repos.entry_points list
+    const entryMatch = yaml.match(/repos:\s*\n\s*entry_points:\s*\n((?:\s*-\s*.+\n?)*)/);
+    if (entryMatch) {
+      entryPointRepos = entryMatch[1]
+        .split("\n")
+        .map((line) => line.replace(/^\s*-\s*/, "").trim().replace(/["']/g, ""))
+        .filter(Boolean);
+    }
+  } catch {
+    // No project config or parse error — use defaults
+  }
+
+  // Default exclude patterns if none configured
+  if (excludeDirs.length === 0) {
+    excludeDirs = ["tests/", "test/", "*/tests/", "*/test/"];
+  }
+
   return {
     workspaceDir: process.env.WORKSPACE_DIR ?? "/data/workspace",
     scratchDir: process.env.SCRATCH_DIR ?? "/data/scratch",
@@ -44,6 +81,8 @@ export function loadPipelineConfig(): PipelineConfig {
       apiKey: process.env.LLM_ANALYSIS_API_KEY ?? "",
       baseUrl: process.env.LLM_BASE_URL ?? "",
     },
+    excludeDirs,
+    entryPointRepos,
   };
 }
 
@@ -66,12 +105,12 @@ export async function runAnalysisPipeline(
   task.progress = { step: 1, stepName: "获取 diff", reposScanned: 0, reposTotal: 0 };
   console.log(`[pipeline:${task.taskId}] Step 1: Getting diff for ${change.repo} (${change.base} → ${change.commit ?? 'HEAD'})`);
 
-  const diff = getDiff(repoManager, change);
+  const diff = getDiff(repoManager, change, config.excludeDirs);
   if (!diff) {
     task.error = `无法获取 ${change.repo} 的 diff`;
     return null;
   }
-  console.log(`[pipeline:${task.taskId}] Step 1 done: diff size = ${diff.length} chars`);
+  console.log(`[pipeline:${task.taskId}] Step 1 done: diff size = ${diff.length} chars (excludeDirs: ${config.excludeDirs?.join(', ') ?? 'none'})`);
 
   // ─── Step 2: Extract symbols (simple heuristic for Phase 1a) ──────────────────
   task.progress = { step: 2, stepName: "提取变更符号", reposScanned: 0, reposTotal: 0 };
@@ -89,9 +128,9 @@ export async function runAnalysisPipeline(
   const allRepos = config.targetRepos ?? repoManager.listRepos();
   const targetRepos = allRepos.filter((r) => r !== change.repo); // exclude self
 
-  // Coarse filter: git grep on NFS
-  console.log(`[pipeline:${task.taskId}] Step 3: Running coarse filter on ${targetRepos.length} repos...`);
-  const coarseHits = coarseFilter(symbols, targetRepos, repoManager);
+  // Coarse filter: parallel git grep on NFS
+  console.log(`[pipeline:${task.taskId}] Step 3: Running coarse filter on ${targetRepos.length} repos (parallel)...`);
+  const coarseHits = await coarseFilter(symbols, targetRepos, repoManager);
   console.log(`[pipeline:${task.taskId}] Step 3 done: ${coarseHits.size} repos hit: ${[...coarseHits].join(', ')}`);
 
   task.progress = {
@@ -101,11 +140,20 @@ export async function runAnalysisPipeline(
     reposTotal: allRepos.length,
   };
 
+  // ─── Step 3.5: Merge entry point repos (always analyzed) ─────────────────────
+  const entryPoints = (config.entryPointRepos ?? []).filter(
+    (r) => r !== change.repo && repoManager.repoExists(r),
+  );
+  const finalTargetRepos = new Set([...coarseHits, ...entryPoints]);
+  if (entryPoints.length > 0) {
+    console.log(`[pipeline:${task.taskId}] Step 3.5: Added entry point repos: ${entryPoints.join(', ')} → total ${finalTargetRepos.size} repos`);
+  }
+
   // ─── Step 4: Spawn pi worker ──────────────────────────────────────────────────
   task.progress = {
     step: 4,
     stepName: "AI 分析中",
-    reposScanned: coarseHits.size,
+    reposScanned: finalTargetRepos.size,
     reposTotal: targetRepos.length,
   };
 
@@ -113,17 +161,18 @@ export async function runAnalysisPipeline(
     diff,
     repoName: change.repo,
     reposRoot: config.workspaceDir,
-    targetRepos: [...coarseHits],
+    targetRepos: [...finalTargetRepos],
+    entryPointRepos: entryPoints,
   });
-  console.log(`[pipeline:${task.taskId}] Step 4: Spawning pi worker, prompt size = ${prompt.length} chars, target repos = ${[...coarseHits].join(', ') || '(none, will scan all)'}`);
+  console.log(`[pipeline:${task.taskId}] Step 4: Spawning pi worker, prompt size = ${prompt.length} chars, target repos = ${[...finalTargetRepos].join(', ') || '(none, will scan all)'}`);
 
   const piConfig: PiWorkerConfig = {
     provider: "tokenhub",
     model: config.llm.model,
     apiKey: config.llm.apiKey,
     baseUrl: config.llm.baseUrl,
-    cwd: config.scratchDir, // Use local fast storage, NOT NFS — pi scans cwd on startup
-    timeoutMs: 1_200_000,
+    cwd: config.workspaceDir, // RPC mode: pi needs access to all repos for tool calls
+    timeoutMs: 900_000, // 15 min (pi needs time for multi-turn tool calls + final report)
     thinkingLevel: "medium",
     skillPath: config.skillPath,
   };
@@ -132,7 +181,7 @@ export async function runAnalysisPipeline(
 
   if (!piResult.success) {
     task.error = `pi agent 分析失败: ${piResult.error}`;
-    // Still try to extract partial result
+    // Still try to extract partial result below
   }
 
   // ─── Step 5: Parse result ─────────────────────────────────────────────────────
@@ -141,10 +190,20 @@ export async function runAnalysisPipeline(
   const jsonResult = extractJsonFromOutput(piResult.output);
 
   if (jsonResult) {
+    // Add metadata about the analysis run
+    (jsonResult as Record<string, unknown>)._meta = {
+      durationMs: piResult.durationMs,
+      turns: piResult.turnCount,
+      toolCalls: piResult.toolCallCount,
+      timedOut: !piResult.success && piResult.error?.includes("timeout"),
+    };
     return jsonResult as unknown as AnalysisResult;
   }
 
-  // If no structured JSON, return raw output as a basic result
+  // No structured JSON found — return raw output as partial result
+  // This happens when pi timed out before producing the final ```json block
+  const isTimeout = !piResult.success || (piResult.durationMs ?? 0) >= (piConfig.timeoutMs ?? 900_000) - 5000;
+  console.log(`[pipeline:${task.taskId}] Step 5: No JSON block found in output (${piResult.output.length} chars, timeout=${isTimeout}). Returning raw partial result.`);
   return {
     summary: {
       totalSymbolsChanged: symbols.length,
@@ -168,19 +227,28 @@ export async function runAnalysisPipeline(
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
-function getDiff(repoManager: RepoManager, change: ChangeSpec): string | null {
+function getDiff(repoManager: RepoManager, change: ChangeSpec, excludeDirs?: string[]): string | null {
   if (!repoManager.repoExists(change.repo)) return null;
 
   const base = change.base ?? "HEAD~1";
   const head = change.commit ?? "HEAD";
-  const diff = repoManager.getDiff(change.repo, base, head);
 
+  if (excludeDirs && excludeDirs.length > 0) {
+    // Use git diff with pathspec exclusions: -- ':!tests/' ':!test/'
+    const diff = repoManager.getDiffWithExcludes(change.repo, base, head, excludeDirs);
+    return diff || null;
+  }
+
+  const diff = repoManager.getDiff(change.repo, base, head);
   return diff || null;
 }
 
 /**
- * Simple heuristic: extract function/class names from diff hunks.
- * Looks for Python def/class declarations in changed lines.
+ * Extract symbols from diff: function/class names from changed lines AND hunk headers.
+ *
+ * Hunk headers (e.g., `@@ -468,7 +468,7 @@ def update_translog(msg):`)
+ * tell us which function/class contains the changed lines, even if the
+ * def/class line itself wasn't modified.
  */
 function extractSymbolsFromDiff(diff: string): Symbol[] {
   const symbols: Symbol[] = [];
@@ -188,6 +256,16 @@ function extractSymbolsFromDiff(diff: string): Symbol[] {
 
   const lines = diff.split("\n");
   for (const line of lines) {
+    // 1. Hunk header — extract containing function/class name
+    //    Format: @@ -start,count +start,count @@ def function_name(...)
+    const hunkMatch = line.match(/^@@\s.*@@\s*(?:def|class)\s+(\w+)/);
+    if (hunkMatch && !seen.has(hunkMatch[1])) {
+      seen.add(hunkMatch[1]);
+      symbols.push({ name: hunkMatch[1], pattern: `${hunkMatch[1]}($$$)` });
+      continue;
+    }
+
+    // 2. Changed lines with def/class declarations
     if (!line.startsWith("+") && !line.startsWith("-")) continue;
     if (line.startsWith("+++") || line.startsWith("---")) continue;
 

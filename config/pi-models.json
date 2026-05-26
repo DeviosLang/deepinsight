@@ -1,7 +1,7 @@
 {
   "providers": {
     "tokenhub": {
-      "baseUrl": "https://tokenhub.tencentmaas.com/plan/v3",
+      "baseUrl": "https://tokenhub.tencentmaas.com/v1",
       "api": "openai-completions",
       "apiKey": "placeholder-overridden-by-cli-flag",
       "compat": {
