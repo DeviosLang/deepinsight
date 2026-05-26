@@ -16,6 +16,15 @@ import { coarseFilter } from "../pre-filter/index.js";
 import { runPiWorker, buildAnalysisPrompt, extractJsonFromOutput } from "./piWorker.js";
 import type { PiWorkerConfig } from "./piWorker.js";
 import type { Symbol } from "../pre-filter/index.js";
+import {
+  startTrace,
+  recordSpan,
+  calculateCost,
+  flushTrace,
+  recordLlmSuccess,
+  recordLlmFailure,
+  isInDegradedMode,
+} from "../observability/trace.js";
 
 export interface PipelineConfig {
   workspaceDir: string;
@@ -100,6 +109,7 @@ export async function runAnalysisPipeline(
   task: AnalysisTask,
   config: PipelineConfig,
 ): Promise<AnalysisResult | null> {
+  const traceCtx = startTrace(task);
   const repoManager = new RepoManager({
     workspaceDir: config.workspaceDir,
     scratchDir: config.scratchDir,
@@ -107,6 +117,11 @@ export async function runAnalysisPipeline(
 
   const change = task.changes[0]; // Phase 1a: single change
   if (!change) return null;
+
+  // Check degradation mode — if LLM is down, skip pi and return grep-only result
+  if (isInDegradedMode()) {
+    console.log(`[pipeline:${task.taskId}] ⚠️ Degraded mode active — skipping LLM, returning grep-only result`);
+  }
 
   // ─── Step 1: Get diff ────────────────────────────────────────────────────────
   task.progress = { step: 1, stepName: "获取 diff", reposScanned: 0, reposTotal: 0 };
@@ -159,42 +174,71 @@ export async function runAnalysisPipeline(
   // ─── Step 4: Spawn pi worker ──────────────────────────────────────────────────
   task.progress = {
     step: 4,
-    stepName: "AI 分析中",
+    stepName: isInDegradedMode() ? "降级模式(跳过LLM)" : "AI 分析中",
     reposScanned: finalTargetRepos.size,
     reposTotal: targetRepos.length,
   };
 
-  const prompt = buildAnalysisPrompt({
-    diff,
-    repoName: change.repo,
-    reposRoot: config.workspaceDir,
-    targetRepos: [...finalTargetRepos],
-    entryPointRepos: entryPoints,
+  recordSpan(traceCtx, "step3_prefilter", traceCtx.startTime, {
+    reposScanned: targetRepos.length,
+    reposHit: coarseHits.size,
+    entryPointsAdded: entryPoints.length,
   });
-  console.log(`[pipeline:${task.taskId}] Step 4: Spawning pi worker, prompt size = ${prompt.length} chars, target repos = ${[...finalTargetRepos].join(', ') || '(none, will scan all)'}`);
 
-  const piConfig: PiWorkerConfig = {
-    provider: "tokenhub",
-    model: config.llm.model,
-    apiKey: config.llm.apiKey,
-    baseUrl: config.llm.baseUrl,
-    cwd: config.workspaceDir, // RPC mode: pi needs access to all repos for tool calls
-    timeoutMs: 900_000, // 15 min (pi needs time for multi-turn tool calls + final report)
-    thinkingLevel: "medium",
-    skillPath: config.skillPath,
-  };
+  let piResult: Awaited<ReturnType<typeof runPiWorker>> | null = null;
 
-  const piResult = await runPiWorker(prompt, piConfig);
+  if (!isInDegradedMode()) {
+    const prompt = buildAnalysisPrompt({
+      diff,
+      repoName: change.repo,
+      reposRoot: config.workspaceDir,
+      targetRepos: [...finalTargetRepos],
+      entryPointRepos: entryPoints,
+    });
+    console.log(`[pipeline:${task.taskId}] Step 4: Spawning pi worker, prompt size = ${prompt.length} chars, target repos = ${[...finalTargetRepos].join(', ') || '(none, will scan all)'}`);
 
-  if (!piResult.success) {
-    task.error = `pi agent 分析失败: ${piResult.error}`;
-    // Still try to extract partial result below
+    const piConfig: PiWorkerConfig = {
+      provider: "tokenhub",
+      model: config.llm.model,
+      apiKey: config.llm.apiKey,
+      baseUrl: config.llm.baseUrl,
+      cwd: config.workspaceDir,
+      timeoutMs: 900_000,
+      thinkingLevel: "medium",
+      skillPath: config.skillPath,
+    };
+
+    const step4Start = Date.now();
+    piResult = await runPiWorker(prompt, piConfig);
+
+    if (piResult.success) {
+      recordLlmSuccess();
+    } else {
+      recordLlmFailure();
+      task.error = `pi agent 分析失败: ${piResult.error}`;
+    }
+
+    const cost = calculateCost(piResult);
+    recordSpan(traceCtx, "step4_piWorker", step4Start, {
+      success: piResult.success,
+      durationMs: piResult.durationMs,
+      outputChars: piResult.output.length,
+      toolCalls: piResult.toolCallCount,
+      turns: piResult.turnCount,
+      ...cost,
+    });
+    console.log(`[pipeline:${task.taskId}] Step 4 cost: $${cost.totalCostUsd.toFixed(4)} (input: ${cost.inputTokens}, output: ${cost.outputTokens})`);
+  } else {
+    // Degraded mode: skip pi, return grep-only result
+    console.log(`[pipeline:${task.taskId}] Step 4: SKIPPED (degraded mode)`);
+    recordSpan(traceCtx, "step4_degraded", Date.now());
   }
 
   // ─── Step 5: Parse result ─────────────────────────────────────────────────────
   task.progress = { step: 5, stepName: "解析结果", reposScanned: coarseHits.size, reposTotal: targetRepos.length };
 
-  const jsonResult = extractJsonFromOutput(piResult.output);
+  const piOutput = piResult?.output ?? "";
+  const jsonResult = extractJsonFromOutput(piOutput);
 
   // Schema-validate before trusting the cast. pi can return malformed JSON
   // (missing summary fields, non-array symbols) on partial completion or
@@ -203,11 +247,14 @@ export async function runAnalysisPipeline(
   if (jsonResult && isValidAnalysisResult(jsonResult)) {
     // Add metadata about the analysis run
     (jsonResult as Record<string, unknown>)._meta = {
-      durationMs: piResult.durationMs,
-      turns: piResult.turnCount,
-      toolCalls: piResult.toolCallCount,
-      timedOut: !piResult.success && piResult.error?.includes("timeout"),
+      durationMs: piResult?.durationMs,
+      turns: piResult?.turnCount,
+      toolCalls: piResult?.toolCallCount,
+      timedOut: piResult ? !piResult.success && piResult.error?.includes("timeout") : false,
+      degraded: isInDegradedMode(),
     };
+    // Flush trace in background (fire-and-forget)
+    flushTrace(traceCtx, task, piResult ?? undefined).catch(() => {});
     return jsonResult as unknown as AnalysisResult;
   }
 
@@ -219,8 +266,12 @@ export async function runAnalysisPipeline(
 
   // No structured JSON found — return raw output as partial result
   // This happens when pi timed out before producing the final ```json block
-  const isTimeout = !piResult.success || (piResult.durationMs ?? 0) >= (piConfig.timeoutMs ?? 900_000) - 5000;
-  console.log(`[pipeline:${task.taskId}] Step 5: No JSON block found in output (${piResult.output.length} chars, timeout=${isTimeout}). Returning raw partial result.`);
+  const isTimeout = piResult ? (!piResult.success || (piResult.durationMs ?? 0) >= 895_000) : false;
+  console.log(`[pipeline:${task.taskId}] Step 5: No JSON block found in output (${piOutput.length} chars, timeout=${isTimeout}). Returning raw partial result.`);
+
+  // Flush trace for partial result
+  flushTrace(traceCtx, task, piResult ?? undefined).catch(() => {});
+
   return {
     summary: {
       totalSymbolsChanged: symbols.length,
@@ -238,7 +289,7 @@ export async function runAnalysisPipeline(
     })),
     untrackable: [],
     globalPatternsMatched: [],
-    _rawOutput: truncateRawOutput(piResult.output), // Truncated for storage efficiency
+    _rawOutput: truncateRawOutput(piOutput),
   } as unknown as AnalysisResult;
 }
 
