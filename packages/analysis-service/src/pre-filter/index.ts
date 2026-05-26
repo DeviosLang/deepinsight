@@ -45,57 +45,67 @@ export async function coarseFilter(
 
   for (let i = 0; i < allRepos.length; i += CONCURRENCY) {
     const batch = allRepos.slice(i, i + CONCURRENCY);
+    // Use allSettled + per-repo try/catch so a single failing repo (timeout,
+    // corrupted git index, NFS hiccup) doesn't drop the entire batch's data.
+    // Without this, one bad repo would void up to CONCURRENCY-1 sibling results.
     const results = await Promise.all(
       batch.map(async (repo) => {
-        if (!repoManager.repoExists(repo)) return { repo, count: 0 };
+        try {
+          if (!repoManager.repoExists(repo)) return { repo, count: 0 };
 
-        let count = 0;
-        for (const symbol of filteredSymbols) {
-          // Layer 1: Direct symbol name
-          const symHits = await repoManager.gitGrepAsync(repo, symbol.name);
-          if (symHits.length > 0) {
-            count++;
-            continue;
-          }
-
-          // Layer 2: HTTP endpoint URL
-          if (symbol.endpointUrl) {
-            const httpHits = await repoManager.gitGrepAsync(repo, symbol.endpointUrl);
-            if (httpHits.length > 0) {
+          let count = 0;
+          for (const symbol of filteredSymbols) {
+            // Layer 1: Direct symbol name
+            const symHits = await repoManager.gitGrepAsync(repo, symbol.name);
+            if (symHits.length > 0) {
               count++;
               continue;
             }
-          }
 
-          // Layer 3: MQ topic
-          if (symbol.eventTopic) {
-            const mqHits = await repoManager.gitGrepAsync(repo, symbol.eventTopic);
-            if (mqHits.length > 0) {
-              count++;
-              continue;
+            // Layer 2: HTTP endpoint URL
+            if (symbol.endpointUrl) {
+              const httpHits = await repoManager.gitGrepAsync(repo, symbol.endpointUrl);
+              if (httpHits.length > 0) {
+                count++;
+                continue;
+              }
+            }
+
+            // Layer 3: MQ topic
+            if (symbol.eventTopic) {
+              const mqHits = await repoManager.gitGrepAsync(repo, symbol.eventTopic);
+              if (mqHits.length > 0) {
+                count++;
+                continue;
+              }
+            }
+
+            // Layer 4: Config reference (YAML/JSON)
+            if (symbol.fullyQualifiedName) {
+              const cfgHits = await repoManager.gitGrepAsync(repo, symbol.fullyQualifiedName);
+              if (cfgHits.length > 0) {
+                count++;
+                continue;
+              }
+            }
+
+            // Layer 5: Reverse dependency (who imports the package)
+            if (symbol.packageName) {
+              const importHits = await repoManager.gitGrepAsync(repo, symbol.packageName);
+              if (importHits.length > 0) {
+                count++;
+                continue;
+              }
             }
           }
 
-          // Layer 4: Config reference (YAML/JSON)
-          if (symbol.fullyQualifiedName) {
-            const cfgHits = await repoManager.gitGrepAsync(repo, symbol.fullyQualifiedName);
-            if (cfgHits.length > 0) {
-              count++;
-              continue;
-            }
-          }
-
-          // Layer 5: Reverse dependency (who imports the package)
-          if (symbol.packageName) {
-            const importHits = await repoManager.gitGrepAsync(repo, symbol.packageName);
-            if (importHits.length > 0) {
-              count++;
-              continue;
-            }
-          }
+          return { repo, count };
+        } catch (err) {
+          console.warn(
+            `[pre-filter] coarseFilter error on ${repo}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return { repo, count: 0 };
         }
-
-        return { repo, count };
       }),
     );
 

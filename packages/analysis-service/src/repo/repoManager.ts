@@ -64,6 +64,10 @@ export class RepoManager {
   /**
    * Run git grep on a repo (works on NFS — sequential reads are tolerable).
    * Searches the working tree (HEAD) for the given pattern.
+   *
+   * Note: `git grep` exits with 1 when no matches are found (not an error)
+   * and 128 on real failure (corrupt repo, bad cwd). Both are mapped to []
+   * here, but real errors are logged to surface NFS / corruption issues.
    */
   gitGrep(repoName: string, pattern: string, pathSpec?: string[]): string[] {
     const repoPath = this.getRepoPath(repoName);
@@ -77,8 +81,17 @@ export class RepoManager {
       timeout: 30_000,
       encoding: "utf-8",
     });
-
-    if (result.status !== 0) return []; // No matches or error
+    if (result.error) {
+      console.warn(`[git grep] ${repoName}: spawn error: ${result.error.message}`);
+      return [];
+    }
+    // status 1 = no match (normal); anything ≥2 indicates a real error.
+    if (result.status !== null && result.status >= 2) {
+      const stderr = result.stderr?.trim();
+      console.warn(`[git grep] ${repoName}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+      return [];
+    }
+    if (result.status !== 0) return []; // No matches
     return result.stdout.trim().split("\n").filter(Boolean);
   }
 
@@ -101,6 +114,11 @@ export class RepoManager {
 
       let stdout = "";
       proc.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+      // Without these, an EPIPE on a stdio stream would surface as an
+      // unhandledError on the child and crash the worker process.
+      proc.stdout.on("error", () => { /* swallowed; close handler decides */ });
+      proc.stderr?.on("data", () => { /* drain to avoid backpressure */ });
+      proc.stderr?.on("error", () => { /* swallow */ });
       proc.on("close", (code) => {
         if (code !== 0) return resolve([]);
         resolve(stdout.trim().split("\n").filter(Boolean));
@@ -119,7 +137,15 @@ export class RepoManager {
       timeout: 5_000,
       encoding: "utf-8",
     });
-    if (result.status !== 0) return null;
+    if (result.error) {
+      console.warn(`[git rev-parse] ${repoName}: spawn error: ${result.error.message}`);
+      return null;
+    }
+    if (result.status !== 0) {
+      const stderr = result.stderr?.trim();
+      console.warn(`[git rev-parse] ${repoName}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+      return null;
+    }
     return result.stdout.trim();
   }
 
@@ -141,6 +167,17 @@ export class RepoManager {
       timeout: 30_000,
       encoding: "utf-8",
     });
+    if (result.error) {
+      console.warn(`[git diff] ${repoName}: spawn error: ${result.error.message}`);
+      return "";
+    }
+    if (result.status !== 0) {
+      // Distinguish a real failure (bad ref, repo corruption, timeout) from
+      // an empty diff (status 0). Without this an unknown ref silently
+      // returns "" and the pipeline reports "no symbols changed".
+      const stderr = result.stderr?.trim();
+      console.warn(`[git diff] ${repoName} ${base}..${head}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+    }
     return result.stdout ?? "";
   }
 
@@ -154,6 +191,14 @@ export class RepoManager {
       timeout: 30_000,
       encoding: "utf-8",
     });
+    if (result.error) {
+      console.warn(`[git diff] ${repoName}: spawn error: ${result.error.message}`);
+      return "";
+    }
+    if (result.status !== 0) {
+      const stderr = result.stderr?.trim();
+      console.warn(`[git diff] ${repoName} ${base}..${head}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+    }
     return result.stdout ?? "";
   }
 
@@ -177,14 +222,45 @@ export class RepoManager {
 
   /**
    * Remove a temporary worktree.
+   *
+   * `git worktree remove --force` can silently fail if the worktree is locked
+   * (e.g. by a concurrent ast-grep process) or if the parent repo's worktree
+   * registry is stale. Without this we'd accumulate orphaned directories on
+   * the scratch volume and subsequent `worktree add` would fail with
+   * "already exists". Falls back to `worktree prune` + filesystem rm.
    */
   removeWorktree(taskId: string, repoName: string): void {
     const repoPath = this.getRepoPath(repoName);
     const wtPath = path.join(this.scratchDir, taskId, repoName);
 
-    spawnSync("git", ["worktree", "remove", "--force", wtPath], {
+    const removeResult = spawnSync("git", ["worktree", "remove", "--force", wtPath], {
       cwd: repoPath,
+      timeout: 30_000,
+      encoding: "utf-8",
     });
+
+    if (removeResult.status !== 0) {
+      const stderr = removeResult.stderr?.toString().trim();
+      console.warn(
+        `[worktree] git worktree remove failed for ${repoName} (task ${taskId}): ${stderr || removeResult.error?.message || "unknown"}; falling back to prune + fs.rm`,
+      );
+
+      // Force-clean the registry entry, then nuke the directory directly.
+      spawnSync("git", ["worktree", "prune"], {
+        cwd: repoPath,
+        timeout: 10_000,
+      });
+
+      try {
+        if (fs.existsSync(wtPath)) {
+          fs.rmSync(wtPath, { recursive: true, force: true });
+        }
+      } catch (err) {
+        console.warn(
+          `[worktree] fs.rm fallback failed for ${wtPath}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
 
     // Clean up empty task directory
     const taskDir = path.join(this.scratchDir, taskId);

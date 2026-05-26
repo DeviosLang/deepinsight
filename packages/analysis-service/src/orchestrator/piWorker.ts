@@ -61,16 +61,51 @@ interface PiEvent {
 /**
  * Run pi agent in RPC mode with a given prompt.
  * Communicates via stdin/stdout JSON protocol.
+ *
+ * @param signal - Optional AbortSignal. If aborted, the child process is
+ *   sent SIGTERM, all timers/readline are cleaned up, and the promise
+ *   resolves with success=false. Without this, callers that time out or
+ *   are cancelled cannot stop the spawned pi process and timers leak.
  */
-export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promise<PiWorkerResult> {
+export async function runPiWorker(
+  prompt: string,
+  config: PiWorkerConfig,
+  signal?: AbortSignal,
+): Promise<PiWorkerResult> {
   const startTime = Date.now();
   const timeoutMs = config.timeoutMs ?? 600_000; // 10 min default
 
-  // Prepend SKILL.md content to prompt
+  // Fast-path: caller already aborted before we spawned anything.
+  if (signal?.aborted) {
+    return {
+      success: false,
+      output: "",
+      error: "aborted before start",
+      durationMs: 0,
+    };
+  }
+
+  // Prepend SKILL.md content to prompt.
+  // Hard cap on file size: a malformed/binary skill file would otherwise be
+  // read fully into memory and prepended to every analysis prompt.
+  const SKILL_MAX_BYTES = 512 * 1024; // 512KB — generous for any reasonable SKILL.md
   let fullPrompt = prompt;
   if (config.skillPath && fs.existsSync(config.skillPath)) {
-    const skillContent = fs.readFileSync(config.skillPath, "utf-8");
-    fullPrompt = skillContent + "\n\n---\n\n" + prompt;
+    try {
+      const stat = fs.statSync(config.skillPath);
+      if (stat.size > SKILL_MAX_BYTES) {
+        console.warn(
+          `[pi:rpc] Skill file ${config.skillPath} exceeds ${SKILL_MAX_BYTES} bytes (${stat.size}); skipping prepend`,
+        );
+      } else {
+        const skillContent = fs.readFileSync(config.skillPath, "utf-8");
+        fullPrompt = skillContent + "\n\n---\n\n" + prompt;
+      }
+    } catch (err) {
+      console.warn(
+        `[pi:rpc] Failed to read skill file ${config.skillPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   console.log(`[pi:rpc] Starting pi --mode rpc, prompt size: ${fullPrompt.length} chars, cwd: ${config.cwd}`);
@@ -94,6 +129,13 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
     let lastAssistantText = ""; // Track each assistant message separately
     let lastEventType = "";
     let lastActivity = Date.now();
+    /**
+     * Tracks the last time pi emitted assistant text (message_update text_delta
+     * or message_end). Used by the timeout handler to avoid SIGKILLing pi
+     * mid-stream when it's currently writing the final JSON report — the most
+     * common cause of truncated reports.
+     */
+    let lastAssistantUpdateAt = 0;
     let toolCallCount = 0;
     let turnCount = 0;
     let usage: PiWorkerResult["usage"];
@@ -135,10 +177,30 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
       } catch {}
     }, steerDelayMs);
 
-    // Timeout handler: send abort then force kill
-    const timeoutHandle = setTimeout(() => {
+    // Timeout handler: send abort then force kill.
+    //
+    // Race-with-steer guard: when steer fired ~85s before this timeout, pi may
+    // STILL be streaming the final JSON report. SIGKILLing it mid-stream is
+    // the most common cause of truncated reports. So if assistant tokens were
+    // produced within the last 8s, we defer the abort sequence by an extra
+    // grace window (one-shot — won't loop forever).
+    let timeoutDeferred = false;
+    // eslint-disable-next-line prefer-const -- reassigned by deferral path below
+    let timeoutHandle: ReturnType<typeof setTimeout> = setTimeout(() => runTimeoutAbort(), timeoutMs);
+    const STREAM_GRACE_MS = 15_000;
+    const STREAM_LIVENESS_MS = 8_000;
+    const runTimeoutAbort = () => {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[pi:timeout +${elapsed}s] Worker timeout (${timeoutMs / 1000}s), sending abort...`);
+      const idleSinceStream = lastAssistantUpdateAt > 0 ? Date.now() - lastAssistantUpdateAt : Number.POSITIVE_INFINITY;
+
+      if (!timeoutDeferred && idleSinceStream < STREAM_LIVENESS_MS) {
+        timeoutDeferred = true;
+        console.log(`[pi:timeout +${elapsed}s] Deferring abort by ${STREAM_GRACE_MS / 1000}s — pi still streaming (last token ${(idleSinceStream / 1000).toFixed(1)}s ago)`);
+        timeoutHandle = setTimeout(runTimeoutAbort, STREAM_GRACE_MS);
+        return;
+      }
+
+      console.log(`[pi:timeout +${elapsed}s] Worker timeout (${timeoutMs / 1000}s${timeoutDeferred ? " + grace" : ""}), sending abort...`);
 
       // Try graceful abort first
       try {
@@ -152,7 +214,7 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
           proc.kill("SIGKILL");
         }
       }, 5000);
-    }, timeoutMs);
+    };
 
     // Activity watchdog: log if no output for 60s
     const watchdog = setInterval(() => {
@@ -165,6 +227,26 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
 
     // Parse stdout line by line (each line is a JSON event)
     const rl = readline.createInterface({ input: proc.stdout!, crlfDelay: Infinity });
+
+    // Stream-level error handlers: without these, an EPIPE/ECONNRESET on the
+    // child's stdio would surface as an unhandledRejection / uncaughtException
+    // and partial results would be silently treated as success.
+    proc.stdout?.on("error", (err: Error) => {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[pi:stdout-error +${elapsed}s] ${err.message}`);
+    });
+    proc.stderr?.on("error", (err: Error) => {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[pi:stderr-error +${elapsed}s] ${err.message}`);
+    });
+    proc.stdin?.on("error", (err: Error) => {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[pi:stdin-error +${elapsed}s] ${err.message}`);
+    });
+    rl.on("error", (err: Error) => {
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`[pi:readline-error +${elapsed}s] ${err.message}`);
+    });
 
     rl.on("line", (line: string) => {
       if (!line.trim()) return;
@@ -228,6 +310,7 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
               const ame = event.assistantMessageEvent as Record<string, unknown>;
               if (ame.type === "text_delta" && typeof ame.delta === "string") {
                 lastAssistantText += ame.delta;
+                lastAssistantUpdateAt = Date.now();
               }
             }
             break;
@@ -246,6 +329,7 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
                 // Append this assistant message to total output (multi-turn accumulation)
                 if (lastAssistantText.length > 0) {
                   textOutput += lastAssistantText + "\n";
+                  lastAssistantUpdateAt = Date.now();
                 }
               }
             }
@@ -286,12 +370,52 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
       console.log(`[pi:stderr +${elapsed}s] ${preview}${text.length > 200 ? "..." : ""}`);
     });
 
-    proc.on("close", (code) => {
-      resolved = true;
+    // Centralised cleanup so close/error/abort all release the same resources.
+    // Without this, an aborted Promise would leave timers and the readline
+    // interface live, holding fds and references to the child process.
+    let abortListener: (() => void) | null = null;
+    const cleanup = () => {
       clearTimeout(timeoutHandle);
       clearTimeout(steerTimer);
       if (killTimer) clearTimeout(killTimer);
       clearInterval(watchdog);
+      try { rl.close(); } catch {}
+      if (signal && abortListener) {
+        try { signal.removeEventListener("abort", abortListener); } catch {}
+      }
+    };
+
+    // Abort handler — triggered when caller cancels via AbortSignal.
+    if (signal) {
+      abortListener = () => {
+        if (resolved) return;
+        resolved = true;
+        const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`[pi:abort +${elapsed}s] AbortSignal received, terminating pi process`);
+        cleanup();
+        try { proc.kill("SIGTERM"); } catch {}
+        // Give the child 2s to exit cleanly, then SIGKILL.
+        setTimeout(() => {
+          try { proc.kill("SIGKILL"); } catch {}
+        }, 2000).unref();
+        const durationMs = Date.now() - startTime;
+        resolve({
+          success: false,
+          output: textOutput,
+          error: "aborted by caller",
+          durationMs,
+          usage,
+          toolCallCount,
+          turnCount,
+        });
+      };
+      signal.addEventListener("abort", abortListener, { once: true });
+    }
+
+    proc.on("close", (code) => {
+      if (resolved) return; // already handled (e.g. via abort)
+      resolved = true;
+      cleanup();
       const durationMs = Date.now() - startTime;
       console.log(`[pi:exit] code=${code}, duration=${(durationMs / 1000).toFixed(1)}s, output=${textOutput.length} chars, turns=${turnCount}, toolCalls=${toolCallCount}`);
 
@@ -311,11 +435,9 @@ export async function runPiWorker(prompt: string, config: PiWorkerConfig): Promi
     });
 
     proc.on("error", (err) => {
+      if (resolved) return;
       resolved = true;
-      clearTimeout(timeoutHandle);
-      clearTimeout(steerTimer);
-      if (killTimer) clearTimeout(killTimer);
-      clearInterval(watchdog);
+      cleanup();
       const durationMs = Date.now() - startTime;
       console.log(`[pi:error] ${err.message}, duration=${(durationMs / 1000).toFixed(1)}s`);
       resolve({

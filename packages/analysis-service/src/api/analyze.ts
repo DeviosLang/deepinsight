@@ -24,12 +24,21 @@ function loadTasksFromDisk(): void {
     const MAX_TASKS = 200;
     let loaded = 0;
     let cleaned = 0;
+    let recovered = 0;
 
     for (const file of files) {
       try {
         const filePath = path.join(TASK_STORE_DIR, file);
         const data = fs.readFileSync(filePath, "utf-8");
-        const task = JSON.parse(data) as AnalysisTask;
+        const parsed = JSON.parse(data) as unknown;
+
+        // Validate before cast — corrupt or schema-skewed (old version) files
+        // would otherwise crash later when `task.createdAt` is undefined.
+        if (!isValidPersistedTask(parsed)) {
+          console.warn(`[task-store] Skipping malformed task file ${file}`);
+          continue;
+        }
+        const task = parsed as AnalysisTask;
 
         // Clean up tasks older than 30 days
         const completedTime = task.completedAt ? new Date(task.completedAt).getTime() : 0;
@@ -37,9 +46,30 @@ function loadTasksFromDisk(): void {
         const taskAge = now - (completedTime || createdTime);
 
         if (taskAge > MAX_AGE_MS) {
-          fs.unlinkSync(filePath);
+          try {
+            fs.unlinkSync(filePath);
+          } catch (err) {
+            // Logged, not silenced: persistent storage failures (NFS down,
+            // permission drift) must not be invisible to operators.
+            console.warn(`[task-store] Failed to delete expired task ${file}: ${err instanceof Error ? err.message : String(err)}`);
+          }
           cleaned++;
           continue;
+        }
+
+        // Recover orphaned tasks: a task persisted as "queued" or "running"
+        // without a completedAt timestamp implies the process died mid-run.
+        // Without this, polling clients would see "running" forever.
+        if ((task.status === "queued" || task.status === "running") && !task.completedAt) {
+          task.status = "failed";
+          task.error = task.error ?? "Task orphaned by service restart";
+          task.completedAt = new Date().toISOString();
+          try {
+            fs.writeFileSync(filePath, JSON.stringify(task, null, 2), "utf-8");
+          } catch (err) {
+            console.warn(`[task-store] Failed to rewrite orphaned task ${task.taskId}:`, err);
+          }
+          recovered++;
         }
 
         tasks.set(task.taskId, task);
@@ -57,16 +87,24 @@ function loadTasksFromDisk(): void {
         return timeB - timeA; // newest first
       });
       const toKeep = new Set(sorted.slice(0, MAX_TASKS).map(([id]) => id));
+      const toEvict: string[] = [];
       for (const [id] of tasks) {
-        if (!toKeep.has(id)) {
-          tasks.delete(id);
-          try { fs.unlinkSync(path.join(TASK_STORE_DIR, `${id}.json`)); } catch {}
-          cleaned++;
+        if (!toKeep.has(id)) toEvict.push(id);
+      }
+      for (const id of toEvict) {
+        tasks.delete(id);
+        try {
+          fs.unlinkSync(path.join(TASK_STORE_DIR, `${id}.json`));
+        } catch (err) {
+          console.warn(`[task-store] Failed to delete LRU-evicted task ${id}: ${err instanceof Error ? err.message : String(err)}`);
         }
+        cleaned++;
       }
     }
 
-    console.log(`[task-store] Loaded ${loaded} tasks, cleaned ${cleaned} expired (from ${TASK_STORE_DIR})`);
+    console.log(
+      `[task-store] Loaded ${loaded} tasks, cleaned ${cleaned} expired, recovered ${recovered} orphaned (from ${TASK_STORE_DIR})`,
+    );
   } catch {
     console.log(`[task-store] No existing tasks found, starting fresh`);
   }
@@ -81,6 +119,22 @@ function persistTask(task: AnalysisTask): void {
   } catch (err) {
     console.error(`[task-store] Failed to persist task ${task.taskId}:`, err);
   }
+}
+
+/**
+ * Minimal shape check for a persisted task. Guards against corrupt JSON files
+ * and stale schema versions on the NFS task store. Only validates fields the
+ * task-store actually dereferences (taskId, status, createdAt, changes).
+ */
+function isValidPersistedTask(obj: unknown): boolean {
+  if (typeof obj !== "object" || obj === null) return false;
+  const o = obj as Record<string, unknown>;
+  if (typeof o.taskId !== "string" || o.taskId.length === 0) return false;
+  if (typeof o.createdAt !== "string") return false;
+  if (typeof o.status !== "string") return false;
+  if (!["queued", "running", "completed", "failed"].includes(o.status)) return false;
+  if (!Array.isArray(o.changes)) return false;
+  return true;
 }
 
 // Load on startup
@@ -117,11 +171,15 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
     tasks.set(taskId, task);
     persistTask(task);
 
-    // Run analysis in background (fire-and-forget)
+    // Run analysis in background (fire-and-forget).
+    // The .catch handler is the LAST line of defense for the task state machine:
+    // if it doesn't set completedAt, polling clients see a "failed" task with
+    // no terminal timestamp and cannot distinguish it from a stuck task.
     startAnalysis(task, pipelineConfig).catch((err) => {
       app.log.error({ taskId, err }, "Analysis failed");
       task.status = "failed";
       task.error = err instanceof Error ? err.message : String(err);
+      task.completedAt = task.completedAt ?? new Date().toISOString();
       persistTask(task);
     });
 

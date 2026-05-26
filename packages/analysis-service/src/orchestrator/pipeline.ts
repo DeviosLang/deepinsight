@@ -10,7 +10,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import YAML from "yaml";
-import type { AnalysisTask, AnalysisResult, ChangeSpec } from "@deepinsight/core";
+import type { AnalysisTask, AnalysisResult, ChangeSpec, RiskLevel } from "@deepinsight/core";
 import { RepoManager } from "../repo/repoManager.js";
 import { coarseFilter } from "../pre-filter/index.js";
 import { runPiWorker, buildAnalysisPrompt, extractJsonFromOutput } from "./piWorker.js";
@@ -58,8 +58,19 @@ export function loadPipelineConfig(): PipelineConfig {
     if (repos && Array.isArray(repos.entry_points)) {
       entryPointRepos = repos.entry_points.map(String);
     }
-  } catch {
-    // No project config or parse error — use defaults
+  } catch (err) {
+    // Differentiate "file missing" (expected on dev) vs "parse / read error"
+    // (misconfigured deployment). Without this, a typo'd YAML would silently
+    // run with default exclusion lists and entry points — the most common
+    // cause of "why did it analyse the wrong repos?" support tickets.
+    const code = (err as NodeJS.ErrnoException)?.code;
+    if (code === "ENOENT") {
+      console.log(`[config] No project config at ${projectConfigPath}, using defaults`);
+    } else {
+      console.warn(
+        `[config] Failed to load project config at ${projectConfigPath}: ${err instanceof Error ? err.message : String(err)} — falling back to defaults`,
+      );
+    }
   }
 
   // Default exclude patterns if none configured
@@ -185,7 +196,11 @@ export async function runAnalysisPipeline(
 
   const jsonResult = extractJsonFromOutput(piResult.output);
 
-  if (jsonResult) {
+  // Schema-validate before trusting the cast. pi can return malformed JSON
+  // (missing summary fields, non-array symbols) on partial completion or
+  // when the LLM hallucinates structure. Without this guard, downstream
+  // consumers crash on `result.summary.riskBreakdown.P0` etc.
+  if (jsonResult && isValidAnalysisResult(jsonResult)) {
     // Add metadata about the analysis run
     (jsonResult as Record<string, unknown>)._meta = {
       durationMs: piResult.durationMs,
@@ -194,6 +209,12 @@ export async function runAnalysisPipeline(
       timedOut: !piResult.success && piResult.error?.includes("timeout"),
     };
     return jsonResult as unknown as AnalysisResult;
+  }
+
+  if (jsonResult) {
+    console.warn(
+      `[pipeline:${task.taskId}] Step 5: Extracted JSON failed schema validation; falling back to raw partial result. Reason: ${describeValidationFailure(jsonResult)}`,
+    );
   }
 
   // No structured JSON found — return raw output as partial result
@@ -222,6 +243,54 @@ export async function runAnalysisPipeline(
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+const REQUIRED_RISK_KEYS: ReadonlyArray<RiskLevel> = ["P0", "P1", "P2", "P3", "NEEDS_HUMAN_REVIEW"];
+
+/**
+ * Validate that an arbitrary parsed-JSON object conforms to AnalysisResult's
+ * required shape. Tolerant of extra fields (forward-compat) but strict on
+ * the fields downstream consumers will dereference.
+ */
+function isValidAnalysisResult(obj: unknown): boolean {
+  if (typeof obj !== "object" || obj === null) return false;
+  const o = obj as Record<string, unknown>;
+
+  // summary.{totalSymbolsChanged, affectedRepos, unaffectedRepos, riskBreakdown}
+  const summary = o.summary;
+  if (typeof summary !== "object" || summary === null) return false;
+  const s = summary as Record<string, unknown>;
+  if (typeof s.totalSymbolsChanged !== "number") return false;
+  if (typeof s.affectedRepos !== "number") return false;
+  if (typeof s.unaffectedRepos !== "number") return false;
+  if (typeof s.riskBreakdown !== "object" || s.riskBreakdown === null) return false;
+  const rb = s.riskBreakdown as Record<string, unknown>;
+  for (const key of REQUIRED_RISK_KEYS) {
+    if (typeof rb[key] !== "number") return false;
+  }
+
+  // symbols must be an array (entries can be loose; downstream tolerates)
+  if (!Array.isArray(o.symbols)) return false;
+
+  // untrackable + globalPatternsMatched: arrays if present
+  if (o.untrackable !== undefined && !Array.isArray(o.untrackable)) return false;
+  if (o.globalPatternsMatched !== undefined && !Array.isArray(o.globalPatternsMatched)) return false;
+
+  return true;
+}
+
+/** Produce a short reason for why validation failed (for logging only). */
+function describeValidationFailure(obj: unknown): string {
+  if (typeof obj !== "object" || obj === null) return "not an object";
+  const o = obj as Record<string, unknown>;
+  if (typeof o.summary !== "object" || o.summary === null) return "missing summary";
+  const s = o.summary as Record<string, unknown>;
+  if (typeof s.riskBreakdown !== "object" || s.riskBreakdown === null) return "missing summary.riskBreakdown";
+  const rb = s.riskBreakdown as Record<string, unknown>;
+  const missingKeys = REQUIRED_RISK_KEYS.filter((k) => typeof rb[k] !== "number");
+  if (missingKeys.length > 0) return `riskBreakdown missing keys: ${missingKeys.join(",")}`;
+  if (!Array.isArray(o.symbols)) return "symbols is not an array";
+  return "unknown validation error";
+}
 
 /**
  * Truncate raw pi output for storage — keep only the last 4KB
