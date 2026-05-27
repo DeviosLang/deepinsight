@@ -18,7 +18,7 @@ import type { PiWorkerResult } from "../orchestrator/piWorker.js";
 let opikClient: any = null;
 let opikInitialized = false;
 
-const OPIK_BASE_URL = process.env.OPIK_BASE_URL ?? "http://opik-backend:8080/api";
+const OPIK_BASE_URL = process.env.OPIK_BASE_URL ?? "http://opik-backend:8080";
 const OPIK_PROJECT = process.env.OPIK_PROJECT ?? "call_chain";
 
 // Cost model (per 1M tokens, USD)
