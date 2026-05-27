@@ -127,26 +127,40 @@ export async function runAnalysisPipeline(
   task.progress = { step: 1, stepName: "获取 diff", reposScanned: 0, reposTotal: 0 };
   console.log(`[pipeline:${task.taskId}] Step 1: Getting diff for ${change.repo} (${change.base} → ${change.commit ?? 'HEAD'})`);
 
+  const step1Start = Date.now();
   const diff = getDiff(repoManager, change, config.excludeDirs);
   if (!diff) {
     task.error = `无法获取 ${change.repo} 的 diff`;
     return null;
   }
+  recordSpan(traceCtx, "step1_getDiff", step1Start, {
+    repo: change.repo,
+    base: change.base,
+    commit: change.commit,
+    diffChars: diff.length,
+    excludeDirs: config.excludeDirs,
+  });
   console.log(`[pipeline:${task.taskId}] Step 1 done: diff size = ${diff.length} chars (excludeDirs: ${config.excludeDirs?.join(', ') ?? 'none'})`);
 
   // ─── Step 2: Extract symbols (simple heuristic for Phase 1a) ──────────────────
   task.progress = { step: 2, stepName: "提取变更符号", reposScanned: 0, reposTotal: 0 };
 
+  const step2Start = Date.now();
   const symbols = extractSymbolsFromDiff(diff);
   if (symbols.length === 0) {
     task.error = "diff 中未发现可分析的符号变更";
     return null;
   }
+  recordSpan(traceCtx, "step2_extractSymbols", step2Start, {
+    symbolCount: symbols.length,
+    symbols: symbols.map((s) => s.name),
+  });
   console.log(`[pipeline:${task.taskId}] Step 2 done: ${symbols.length} symbols: ${symbols.map(s => s.name).join(', ')}`);
 
   // ─── Step 3: Pre-filter (coarse only for Phase 1a) ────────────────────────────
   task.progress = { step: 3, stepName: "预筛目标仓库", reposScanned: 0, reposTotal: 0 };
 
+  const step3Start = Date.now();
   const allRepos = config.targetRepos ?? repoManager.listRepos();
   const targetRepos = allRepos.filter((r) => r !== change.repo); // exclude self
 
@@ -179,7 +193,7 @@ export async function runAnalysisPipeline(
     reposTotal: targetRepos.length,
   };
 
-  recordSpan(traceCtx, "step3_prefilter", traceCtx.startTime, {
+  recordSpan(traceCtx, "step3_prefilter", step3Start, {
     reposScanned: targetRepos.length,
     reposHit: coarseHits.size,
     entryPointsAdded: entryPoints.length,

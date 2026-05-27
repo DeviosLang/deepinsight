@@ -121,25 +121,37 @@ export async function flushTrace(
       projectName: OPIK_PROJECT,
       input: {
         project: task.project,
-        changes: task.changes,
+        repo: task.changes[0]?.repo,
+        commit: task.changes[0]?.commit,
+        base: task.changes[0]?.base,
       },
       output: {
         status: task.status,
         error: task.error,
         hasResult: !!task.result,
+        resultSizeChars: task.result ? JSON.stringify(task.result).length : 0,
       },
       metadata: {
         durationMs,
+        durationFormatted: `${(durationMs / 1000).toFixed(1)}s`,
         inputTokens: cost.inputTokens,
         outputTokens: cost.outputTokens,
         totalCostUsd: cost.totalCostUsd,
         toolCallCount: piResult?.toolCallCount ?? 0,
         turnCount: piResult?.turnCount ?? 0,
+        piOutputChars: piResult?.output.length ?? 0,
         timedOut: piResult ? piResult.durationMs >= 895_000 : false,
+        steerTriggered: piResult ? piResult.durationMs >= 800_000 : false,
+        degradedMode: !piResult,
       },
+      tags: [
+        task.status ?? "unknown",
+        piResult?.toolCallCount ? `tools:${piResult.toolCallCount}` : "tools:0",
+        piResult && piResult.durationMs >= 895_000 ? "timeout" : "completed",
+      ],
     });
 
-    // Add spans
+    // Add spans for each pipeline step
     for (const span of ctx.spans) {
       trace.span({
         name: span.name,
@@ -150,7 +162,8 @@ export async function flushTrace(
     }
 
     await trace.end();
-    console.log(`[opik] Trace flushed: ${task.taskId} (${durationMs}ms, $${cost.totalCostUsd.toFixed(4)})`);
+    await client.flush();
+    console.log(`[opik] Trace flushed: ${task.taskId} (${(durationMs / 1000).toFixed(1)}s, $${cost.totalCostUsd.toFixed(4)}, turns=${piResult?.turnCount ?? 0}, tools=${piResult?.toolCallCount ?? 0})`);
   } catch (err) {
     // Never let tracing failure break the pipeline
     console.warn(`[opik] Failed to flush trace ${task.taskId}: ${err instanceof Error ? err.message : String(err)}`);
