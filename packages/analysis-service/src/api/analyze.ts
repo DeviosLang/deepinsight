@@ -7,6 +7,7 @@ import * as path from "node:path";
 import type { FastifyInstance } from "fastify";
 import type { AnalysisTask, ChangeSpec, AnalysisOptions } from "@deepinsight/core";
 import { runAnalysisPipeline, loadPipelineConfig } from "../orchestrator/pipeline.js";
+import { renderMarkdown } from "../render/markdown.js";
 
 // Persistent task store — writes to NFS for Pod restart survival
 const TASK_STORE_DIR = path.join(process.env.WORKSPACE_DIR ?? "/data/workspace", ".deepinsight", "tasks");
@@ -191,16 +192,32 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // Query task status
-  app.get<{ Params: { taskId: string } }>("/analyze/:taskId", async (req, reply) => {
-    const { taskId } = req.params;
-    const task = tasks.get(taskId);
+  app.get<{ Params: { taskId: string }; Querystring: { format?: string } }>(
+    "/analyze/:taskId",
+    async (req, reply) => {
+      const { taskId } = req.params;
+      const task = tasks.get(taskId);
 
-    if (!task) {
-      return reply.status(404).send({ error: "Task not found" });
-    }
+      if (!task) {
+        return reply.status(404).send({ error: "Task not found" });
+      }
 
-    return task;
-  });
+      // Optional Markdown rendering for human-friendly review.
+      // Renderer tolerates partial/unfinished tasks (it'll just emit fewer
+      // sections), so we don't gate on `task.status === "completed"`.
+      const format = (req.query?.format ?? "").toLowerCase();
+      if (format === "markdown" || format === "md") {
+        // Renderer accepts the full task envelope or bare result.
+        // Cast to Record<string, unknown> for the loose-typed renderer input.
+        const md = renderMarkdown(task as unknown as Record<string, unknown>);
+        return reply
+          .type("text/markdown; charset=utf-8")
+          .send(md);
+      }
+
+      return task;
+    },
+  );
 
   // Cancel task
   app.delete<{ Params: { taskId: string } }>("/analyze/:taskId", async (req, reply) => {

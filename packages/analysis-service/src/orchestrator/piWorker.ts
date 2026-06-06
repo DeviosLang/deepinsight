@@ -467,6 +467,7 @@ export function buildAnalysisPrompt(params: {
   reposRoot: string;
   targetRepos: string[];
   entryPointRepos?: string[];
+  sinkRepos?: string[];
   agentsMd?: string;
   globalPatterns?: string;
 }): string {
@@ -497,6 +498,22 @@ ${params.entryPointRepos.map((r) => `- ${r} [ENTRY]`).join("\n")}
 `);
   }
 
+  // Sink repos section (downstream-chain convergence anchors)
+  if (params.sinkRepos && params.sinkRepos.length > 0) {
+    parts.push(`## 终点模块（最下层 / 下行链锚点）
+以下仓库是系统的终点/最下层模块（如 DAO/DB/存储），是下行链的优先收敛目标：
+${params.sinkRepos.map((r) => `- ${r} [SINK]`).join("\n")}
+
+构建下行链：从变更符号向下游 callee 追踪，检查变更点对下游的调用是否仍满足契约（参数/异常/事务/schema）。
+追踪终止条件（每条路径独立判定，满足任一即停）：
+1. callee 属于 [SINK] → 标注 reachesSink=true 并给出 risk；
+2. callee 无下游调用（叶子）→ 自然停，reachesSink=false；
+3. 深度 ≥ 2 且该路径未朝 [SINK] 收敛 → 剪枝停；
+4. 深度 ≥ 4（绝对护栏）→ 无条件停。
+即 [SINK] 是优先收敛目标、可突破深度 2 追到（上限 4）；深度 2 仅是"既没到 sink、又判断不出朝 sink 走"时的兜底剪枝。
+`);
+  }
+
   if (params.agentsMd) {
     parts.push(`## 架构上下文 (AGENTS.md)
 ${params.agentsMd}
@@ -513,22 +530,22 @@ ${params.globalPatterns}
 
 按 SKILL.md 中的协议执行：
 
-1. 解读 diff 语义，提取所有变更符号，判断初始风险
-2. 使用 bash 工具运行 grep/find/ast-grep 在目标仓库中搜索调用点，构建完整跨仓调用链
-3. 在调用链上传播风险（读取调用点代码判断领域上下文）
-4. 检查测试覆盖
-5. 输出结构化 JSON 报告（含调用链、影响范围、风险等级）
-6. 对每个 P0/P1 风险项和每个受影响的入口 API，生成测试验证场景：
-   - scenario: 测试场景名称
-   - affected_api: 入口 API 路径（如 POST /api/v2/instance/action）
-   - api_params: 该 API 的请求参数示例（从入口仓库代码中读取 handler/view 的参数定义，提取必填参数和触发该风险路径所需的参数组合）
-   - preconditions: 前置依赖列表（DB 状态、MQ 配置、服务依赖、数据准备）
-   - steps: 从入口 API 开始的执行步骤（含具体参数值）
-   - oracle: 观察点和验证规则（具体 DB 字段变化、日志关键字、HTTP 返回码、监控指标变化）
+1. 解读 diff 语义，提取所有变更符号（忽略 test_*/Test* 测试函数），判断初始风险
+2. 使用 bash 工具运行 grep/find 在目标仓库中搜索调用点，构建完整跨仓调用链
+3. **必须追踪从 [ENTRY] 入口仓库到变更符号的完整调用路径**（包括通过 MQ/HTTP/框架调度的间接链路）
+4. **构建下行链**：从变更符号向下游 callee 追踪，检查对下游的调用契约是否仍成立，优先收敛到 [SINK]（见上方终止条件），输出 downstreamContracts
+5. 在调用链上传播风险（读取调用点代码判断领域上下文）
+6. 检查测试覆盖
+7. 输出结构化 JSON 报告
 
-**api_params 提取方法**：对每个 affected_api，在入口仓库中用 grep/find 找到对应的 handler 函数，读取其参数定义（如 request body schema、query params、path params），给出能触发该风险路径的参数组合示例。
-
-**输出格式**：最终结果用 \`\`\`json ... \`\`\` 包裹，确保可以被程序解析。
+**输出格式（严格遵守，否则结果会丢失）**：
+- 最终结果必须用 \`\`\`json ... \`\`\` 包裹
+- JSON 必须包含 summary.riskBreakdown（含 P0/P1/P2/P3/NEEDS_HUMAN_REVIEW 五个数字字段）
+- symbols 数组每个元素必须有 callTree（数组）和 riskTable（数组）；如有下行契约则带 downstreamContracts（数组，可为空）
+- callTree 从变更点逐层向上追踪到入口仓库
+- downstreamContracts 从变更点向下游追踪，reachesSink=true 时才填 risk
+- test_scenarios 放顶层
+- 严格按 SKILL.md Step 5 的 schema 示例输出
 `);
 
   return parts.join("\n");
@@ -554,4 +571,67 @@ export function extractJsonFromOutput(output: string): Record<string, unknown> |
   } catch {
     return null;
   }
+}
+
+/**
+ * Run pi worker with exponential backoff retry + model fallback.
+ *
+ * Retry strategy:
+ * - Up to 3 attempts total
+ * - Exponential backoff: 2s, 4s, 8s between attempts
+ * - On 2nd failure: if fallbackModel configured, switch to it
+ * - On timeout: no retry (return partial result immediately)
+ */
+export async function runPiWorkerWithRetry(
+  prompt: string,
+  config: PiWorkerConfig & { fallbackModel?: string },
+  signal?: AbortSignal,
+): Promise<PiWorkerResult> {
+  const MAX_RETRIES = 3;
+  const BASE_DELAY_MS = 2000;
+
+  let lastResult: PiWorkerResult | null = null;
+  let currentConfig = { ...config };
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    if (signal?.aborted) {
+      return lastResult ?? { success: false, output: "", error: "aborted", durationMs: 0 };
+    }
+
+    lastResult = await runPiWorker(prompt, currentConfig, signal);
+
+    // Success — return immediately
+    if (lastResult.success) {
+      if (attempt > 1) {
+        console.log(`[pi:retry] Succeeded on attempt ${attempt}${currentConfig.model !== config.model ? ` (fallback model: ${currentConfig.model})` : ""}`);
+      }
+      return lastResult;
+    }
+
+    // Timeout — don't retry, return partial result
+    const isTimeout = lastResult.error?.includes("timeout") || (lastResult.durationMs >= (config.timeoutMs ?? 600_000) * 0.95);
+    if (isTimeout) {
+      console.log(`[pi:retry] Timeout on attempt ${attempt}, returning partial result`);
+      return lastResult;
+    }
+
+    // Last attempt — don't retry
+    if (attempt >= MAX_RETRIES) {
+      console.log(`[pi:retry] Failed after ${MAX_RETRIES} attempts: ${lastResult.error}`);
+      return lastResult;
+    }
+
+    // Switch to fallback model on 2nd failure
+    if (attempt >= 2 && config.fallbackModel && currentConfig.model !== config.fallbackModel) {
+      console.log(`[pi:retry] Switching to fallback model: ${config.fallbackModel}`);
+      currentConfig = { ...currentConfig, model: config.fallbackModel };
+    }
+
+    // Exponential backoff with jitter
+    const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1) * (0.75 + Math.random() * 0.5);
+    console.log(`[pi:retry] Attempt ${attempt} failed (${lastResult.error}), retrying in ${Math.round(delay)}ms...`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+  }
+
+  return lastResult ?? { success: false, output: "", error: "all retries exhausted", durationMs: 0 };
 }

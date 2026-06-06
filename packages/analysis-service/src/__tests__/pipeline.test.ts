@@ -218,3 +218,125 @@ describe("GENERIC_NAMES filter", () => {
     expect(shouldFilter("set")).toBe(true);
   });
 });
+
+describe("sanitizeDownstreamContracts (EP-005 boundary)", () => {
+  // Re-implement the sanitizer for unit testing (same logic as pipeline.ts).
+  function sanitizeDownstreamContracts(raw: unknown): Array<Record<string, unknown>> {
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) return [];
+    const out: Array<Record<string, unknown>> = [];
+    for (const item of raw) {
+      if (typeof item !== "object" || item === null) continue;
+      const c = item as Record<string, unknown>;
+      if (typeof c.callee !== "string" || typeof c.repo !== "string") continue;
+      out.push(c);
+    }
+    return out;
+  }
+
+  test("returns empty array for undefined/null", () => {
+    expect(sanitizeDownstreamContracts(undefined)).toEqual([]);
+    expect(sanitizeDownstreamContracts(null)).toEqual([]);
+  });
+
+  test("drops non-array input (malformed LLM output)", () => {
+    expect(sanitizeDownstreamContracts("not an array")).toEqual([]);
+    expect(sanitizeDownstreamContracts(42)).toEqual([]);
+    expect(sanitizeDownstreamContracts({ callee: "x" })).toEqual([]);
+  });
+
+  test("skips elements missing callee/repo", () => {
+    const raw = [
+      { callee: "good", repo: "vstation_compute", file: "a.py", line: 1 },
+      { callee: "no_repo" },
+      { repo: "no_callee" },
+      "not an object",
+      null,
+    ];
+    const result = sanitizeDownstreamContracts(raw);
+    expect(result).toHaveLength(1);
+    expect(result[0].callee).toBe("good");
+  });
+
+  test("keeps well-formed contracts", () => {
+    const raw = [
+      { callee: "CDbAccess.update", repo: "vstation_compute", file: "dao.py", line: 88, reachesSink: true },
+    ];
+    expect(sanitizeDownstreamContracts(raw)).toHaveLength(1);
+  });
+});
+
+describe("symbol isEmpty rule (downstream-aware)", () => {
+  // Mirrors the merge isEmpty check: a symbol with only downstreamContracts
+  // must NOT be dropped as an empty shell.
+  function isEmpty(sym: { callTree?: unknown[]; riskTable?: unknown[]; downstreamContracts?: unknown[]; diffSemantic?: string }): boolean {
+    const ct = Array.isArray(sym.callTree) ? sym.callTree : [];
+    const rt = Array.isArray(sym.riskTable) ? sym.riskTable : [];
+    const dc = Array.isArray(sym.downstreamContracts) ? sym.downstreamContracts : [];
+    return ct.length === 0 && rt.length === 0 && dc.length === 0 && !sym.diffSemantic;
+  }
+
+  test("truly empty shell is empty", () => {
+    expect(isEmpty({ callTree: [], riskTable: [], downstreamContracts: [] })).toBe(true);
+  });
+
+  test("symbol with only downstreamContracts is NOT empty", () => {
+    expect(isEmpty({ callTree: [], riskTable: [], downstreamContracts: [{ callee: "x" }] })).toBe(false);
+  });
+
+  test("symbol with diffSemantic is NOT empty", () => {
+    expect(isEmpty({ callTree: [], riskTable: [], downstreamContracts: [], diffSemantic: "改了某处" })).toBe(false);
+  });
+});
+
+describe("entry/sink repo derivation (role-based + legacy)", () => {
+  // Mirrors loadPipelineConfig's repo-role parsing.
+  function deriveEntryAndSinks(rawRepos: unknown): { entry: string[]; sinks: string[] } {
+    const entrySet = new Set<string>();
+    const sinkSet = new Set<string>();
+    if (Array.isArray(rawRepos)) {
+      for (const item of rawRepos) {
+        if (typeof item !== "object" || item === null) continue;
+        const r = item as Record<string, unknown>;
+        if (typeof r.name !== "string") continue;
+        if (r.role === "entry_point") entrySet.add(r.name);
+        else if (r.role === "sink") sinkSet.add(r.name);
+      }
+    } else if (typeof rawRepos === "object" && rawRepos !== null) {
+      const repos = rawRepos as Record<string, unknown>;
+      if (Array.isArray(repos.entry_points)) for (const x of repos.entry_points) entrySet.add(String(x));
+      if (Array.isArray(repos.sinks)) for (const x of repos.sinks) sinkSet.add(String(x));
+    }
+    return { entry: [...entrySet], sinks: [...sinkSet] };
+  }
+
+  test("list form: derives entry/sink from role field", () => {
+    const repos = [
+      { name: "cvm_api", role: "entry_point" },
+      { name: "vstation_compute", role: "sink" },
+      { name: "compute-service", role: "core" },
+      { name: "frame", role: "shared_lib" },
+    ];
+    const { entry, sinks } = deriveEntryAndSinks(repos);
+    expect(entry).toEqual(["cvm_api"]);
+    expect(sinks).toEqual(["vstation_compute"]);
+  });
+
+  test("legacy map form: derives from flat arrays", () => {
+    const repos = { entry_points: ["cvm_api", "cxm_api"], sinks: ["vstation_compute"] };
+    const { entry, sinks } = deriveEntryAndSinks(repos);
+    expect(entry).toEqual(["cvm_api", "cxm_api"]);
+    expect(sinks).toEqual(["vstation_compute"]);
+  });
+
+  test("skips malformed list items", () => {
+    const repos = [{ name: "ok", role: "sink" }, null, "str", { role: "sink" /* no name */ }];
+    const { sinks } = deriveEntryAndSinks(repos);
+    expect(sinks).toEqual(["ok"]);
+  });
+
+  test("empty / undefined repos yields empty arrays", () => {
+    expect(deriveEntryAndSinks(undefined)).toEqual({ entry: [], sinks: [] });
+    expect(deriveEntryAndSinks([])).toEqual({ entry: [], sinks: [] });
+  });
+});

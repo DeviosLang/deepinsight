@@ -132,7 +132,36 @@ export interface SymbolAnalysis {
   initialRisk: RiskSeverity;
   callTree: RiskNode[];
   riskTable: RiskTableEntry[];
+  /**
+   * Downstream contract checks (callee direction).
+   *
+   * Whereas `callTree` traces upward ("who calls me", impact radius),
+   * this traces downward ("what do I call") to verify the change still
+   * honours its dependencies' param/exception/transaction/schema contracts.
+   * These do NOT participate in P0-P3 risk propagation; a `risk` value is
+   * only assigned when the downstream path reaches a [SINK] module.
+   */
+  downstreamContracts?: DownstreamContract[];
   testPlan?: TestPlan[];
+}
+
+export interface DownstreamContract {
+  /** Downstream callee function the changed symbol invokes */
+  callee: string;
+  repo: string;
+  file: string;
+  line: number;
+  callType: CallType;
+  contractKind: "param" | "exception" | "transaction" | "schema" | "other";
+  status: "ok" | "violated" | "uncertain";
+  /** Whether this downstream path reaches a configured [SINK] module */
+  reachesSink: boolean;
+  /** The [SINK] repo reached, when reachesSink is true */
+  sinkRepo?: string;
+  /** How the change affects this contract */
+  detail: string;
+  /** Risk level — only assigned when reachesSink is true */
+  risk?: RiskLevel;
 }
 
 export interface RiskTableEntry {
@@ -234,7 +263,7 @@ export interface RepoConfig {
   url: string;
   language: string;
   branch?: string;
-  role?: "entry_point" | "shared_lib" | "core" | "service";
+  role?: "entry_point" | "shared_lib" | "core" | "service" | "sink";
   tags?: string[];
 }
 

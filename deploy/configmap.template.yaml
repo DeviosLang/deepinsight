@@ -16,9 +16,16 @@ data:
         url: "<GIT_URL_WITH_AUTH>"
         branch: master
         language: python
-        role: entry_point
+        role: entry_point      # [ENTRY] — upward call-chain target
 
-      # ... add more repos
+      - name: "<SINK_REPO_NAME>"
+        url: "<GIT_URL_WITH_AUTH>"
+        branch: master
+        language: python
+        role: sink             # [SINK] — downstream-chain anchor (DAO/DB/storage), e.g. vstation_compute
+
+      # ... add more repos. The pipeline reads each repo's `role` directly:
+      #   entry_point → [ENTRY], sink → [SINK], shared_lib/core/service → ordinary.
 
     llm:
       analysis:

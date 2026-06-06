@@ -150,6 +150,83 @@ export class RepoManager {
   }
 
   /**
+   * Fetch a specific branch from remote origin.
+   * Returns true if fetch succeeded.
+   */
+  fetchBranch(repoName: string, branch: string): boolean {
+    const repoPath = this.getRepoPath(repoName);
+    console.log(`[git fetch] ${repoName}: fetching origin ${branch}`);
+    const result = spawnSync("git", ["fetch", "origin", branch], {
+      cwd: repoPath,
+      timeout: 60_000,
+      encoding: "utf-8",
+    });
+    if (result.error) {
+      console.warn(`[git fetch] ${repoName}: spawn error: ${result.error.message}`);
+      return false;
+    }
+    if (result.status !== 0) {
+      const stderr = result.stderr?.trim();
+      console.warn(`[git fetch] ${repoName}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Resolve a git ref (branch name, FETCH_HEAD, tag, etc.) to a commit hash.
+   */
+  resolveRef(repoName: string, ref: string): string | null {
+    const repoPath = this.getRepoPath(repoName);
+    const result = spawnSync("git", ["rev-parse", ref], {
+      cwd: repoPath,
+      timeout: 5_000,
+      encoding: "utf-8",
+    });
+    if (result.error || result.status !== 0) {
+      return null;
+    }
+    return result.stdout.trim();
+  }
+
+  /**
+   * Compute the merge-base (fork point) between two refs.
+   * Used to find where a feature branch diverged from the base branch.
+   */
+  getMergeBase(repoName: string, ref1: string, ref2: string): string | null {
+    const repoPath = this.getRepoPath(repoName);
+    const result = spawnSync("git", ["merge-base", ref1, ref2], {
+      cwd: repoPath,
+      timeout: 10_000,
+      encoding: "utf-8",
+    });
+    if (result.error || result.status !== 0) {
+      return null;
+    }
+    return result.stdout.trim();
+  }
+
+  /**
+   * List remote branches matching a pattern (e.g., "release/v*").
+   * Returns sorted list (descending — newest version first).
+   */
+  listMatchingBranches(repoName: string, pattern: string): string[] {
+    const repoPath = this.getRepoPath(repoName);
+    const result = spawnSync(
+      "git",
+      ["branch", "-r", "--list", `origin/${pattern}`, "--sort=-version:refname"],
+      { cwd: repoPath, timeout: 10_000, encoding: "utf-8" },
+    );
+    if (result.error || result.status !== 0) {
+      return [];
+    }
+    return result.stdout
+      .split("\n")
+      .map((line) => line.trim().replace(/^origin\//, ""))
+      .filter(Boolean);
+  }
+
+  /**
    * Get diff between two refs, excluding specified directories.
    * Uses git pathspec exclusion syntax: ':!path/'
    */
@@ -286,6 +363,26 @@ export class RepoManager {
     } finally {
       this.removeWorktree(taskId, repoName);
     }
+  }
+
+  /**
+   * Read a file relative to the workspace root.
+   * Returns null if file doesn't exist or read fails.
+   */
+  readFile(relativePath: string): string | null {
+    const fullPath = path.join(this.workspaceDir, relativePath);
+    try {
+      return fs.readFileSync(fullPath, "utf-8");
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Check if a file exists relative to workspace root.
+   */
+  fileExists(relativePath: string): boolean {
+    return fs.existsSync(path.join(this.workspaceDir, relativePath));
   }
 
   /**

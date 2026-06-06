@@ -11,6 +11,7 @@ function buildAnalysisPrompt(params: {
   reposRoot: string;
   targetRepos: string[];
   entryPointRepos?: string[];
+  sinkRepos?: string[];
   agentsMd?: string;
   globalPatterns?: string;
 }): string {
@@ -20,6 +21,10 @@ function buildAnalysisPrompt(params: {
 
   if (params.entryPointRepos && params.entryPointRepos.length > 0) {
     parts.push(`## 入口仓库（对外 API 层）\n以下仓库是系统对外暴露的 API 入口，必须分析变更是否通过调用链传递到这些入口：\n${params.entryPointRepos.map((r) => `- ${r} [ENTRY]`).join("\n")}\n\n即使变更符号未直接出现在入口仓库中，也要追踪中间层（如 frame/shared_lib）是否桥接了影响到入口 API。\n`);
+  }
+
+  if (params.sinkRepos && params.sinkRepos.length > 0) {
+    parts.push(`## 终点模块（最下层 / 下行链锚点）\n以下仓库是系统的终点/最下层模块（如 DAO/DB/存储），是下行链的优先收敛目标：\n${params.sinkRepos.map((r) => `- ${r} [SINK]`).join("\n")}\n`);
   }
 
   if (params.agentsMd) {
@@ -84,6 +89,30 @@ describe("buildAnalysisPrompt", () => {
     });
     expect(prompt).not.toContain("[ENTRY]");
     expect(prompt).not.toContain("入口仓库");
+  });
+
+  test("includes sink repos with [SINK] marker", () => {
+    const prompt = buildAnalysisPrompt({
+      diff: "some diff",
+      repoName: "aurora",
+      reposRoot: "/workspace",
+      targetRepos: ["repo_a"],
+      sinkRepos: ["vstation_compute"],
+    });
+    expect(prompt).toContain("vstation_compute [SINK]");
+    expect(prompt).toContain("终点模块");
+  });
+
+  test("omits sink section when empty", () => {
+    const prompt = buildAnalysisPrompt({
+      diff: "diff",
+      repoName: "repo",
+      reposRoot: "/ws",
+      targetRepos: ["a"],
+      sinkRepos: [],
+    });
+    expect(prompt).not.toContain("[SINK]");
+    expect(prompt).not.toContain("终点模块");
   });
 
   test("includes agentsMd when provided", () => {

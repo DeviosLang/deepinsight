@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 .pnpm-store/
+.codebuddy/
 
 # Build outputs
 dist/
@@ -27,3 +28,11 @@ coverage/
 # Runtime
 *.log
 tmp/
+ERROR.md
+
+# Local Claude Code config (private to each developer)
+.claude/
+
+# Internal review notes (not for public consumption)
+AGENTS_MD_INFRASTRUCTURE_ANALYSIS.md
+AGENTS_MD_QUICK_REFERENCE.md

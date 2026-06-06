@@ -13,7 +13,8 @@
     "format": "biome format --write .",
     "typecheck": "pnpm -r typecheck",
     "precheck": "pnpm typecheck && pnpm lint && pnpm test",
-    "clean": "pnpm -r clean && rm -rf node_modules"
+    "clean": "pnpm -r clean && rm -rf node_modules",
+    "generate-agents-md": "pnpm --filter @deepinsight/indexer generate"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",

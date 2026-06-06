@@ -58,6 +58,24 @@ repos:
     role: service
     tags: ["gateway", "auth"]
 
+  # Terminal / lowest-layer module (DAO/DB/storage) — downstream-chain [SINK] anchor.
+  - name: "vstation_compute"
+    url: "<GIT_BASE_URL>/compute/vstation.git"
+    branch: master
+    language: python
+    role: sink
+    tags: ["compute", "storage", "sink"]
+
+# ── How role drives analysis (RUNTIME-EFFECTIVE) ──
+# The pipeline reads each repo's `role` field directly:
+#   role: entry_point  → [ENTRY] — upward call-chain targets ("who calls the change")
+#   role: sink         → [SINK]  — downstream-chain convergence anchors ("what the change calls")
+#   role: shared_lib / core / service → ordinary repo
+# A repo's role lives on its own list item above — single source of truth, no
+# separate arrays to keep in sync. (A legacy `repos.entry_points` / `repos.sinks`
+# map form is still accepted for backward compatibility, but the list+role form
+# above is preferred.)
+
 # ── Knowledge Base (optional) ──
 knowledge_base:
   repo: "<GIT_BASE_URL>/platform/ai-docs.git"

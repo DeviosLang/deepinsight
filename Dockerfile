@@ -9,6 +9,7 @@ WORKDIR /app
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
 COPY packages/core/package.json ./packages/core/
 COPY packages/analysis-service/package.json ./packages/analysis-service/
+COPY packages/indexer/package.json ./packages/indexer/
 
 RUN pnpm install --frozen-lockfile 2>/dev/null || pnpm install
 
@@ -16,6 +17,7 @@ RUN pnpm install --frozen-lockfile 2>/dev/null || pnpm install
 COPY tsconfig.json ./
 COPY packages/core/ ./packages/core/
 COPY packages/analysis-service/ ./packages/analysis-service/
+COPY packages/indexer/ ./packages/indexer/
 
 RUN pnpm -r build
 
@@ -34,6 +36,9 @@ RUN npm install -g @ast-grep/cli
 # Install pi agent
 RUN npm install -g @earendil-works/pi-coding-agent
 
+# Install tsx (for running indexer scripts)
+RUN npm install -g tsx
+
 RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 
 WORKDIR /app
@@ -50,6 +55,14 @@ COPY --from=builder /app/packages/analysis-service/node_modules/ ./packages/anal
 
 # Copy pi skill files
 COPY packages/pi-skill/ ./packages/pi-skill/
+
+# Copy indexer (for generate-agents-md)
+COPY packages/indexer/ ./packages/indexer/
+RUN cd packages/indexer && npm install --omit=dev
+
+# Copy CLI scripts (e.g. render-report.ts) — useful for in-pod debugging
+# and report rendering against the on-NFS task store.
+COPY scripts/ ./scripts/
 
 # Configure pi agent custom provider
 RUN mkdir -p /root/.pi/agent
