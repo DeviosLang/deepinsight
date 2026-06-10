@@ -50,6 +50,13 @@ spec:
                 secretKeyRef:
                   name: deepinsight-secrets
                   key: llm-api-key
+            # graphify reads TOKENHUB_API_KEY for the custom provider declared
+            # in /root/.graphify/providers.json. Re-uses the same secret.
+            - name: TOKENHUB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: llm-api-key
             - name: LLM_BASE_URL
               valueFrom:
                 secretKeyRef:

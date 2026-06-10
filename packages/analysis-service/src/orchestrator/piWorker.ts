@@ -470,6 +470,18 @@ export function buildAnalysisPrompt(params: {
   sinkRepos?: string[];
   agentsMd?: string;
   globalPatterns?: string;
+  /**
+   * Knowledge bases pi can query on demand via `graphify query`. Each entry is
+   * advertised in the prompt with its name + description + graph.json path so
+   * pi can decide which (if any) to consult while building the analysis.
+   */
+  knowledgeBases?: Array<{
+    name: string;
+    description: string;
+    /** Routing hints — pi matches diff content against these */
+    keywords: string[];
+    graphPath: string;
+  }>;
 }): string {
   const parts: string[] = [];
 
@@ -524,6 +536,52 @@ ${params.agentsMd}
     parts.push(`## 历史风险模式 (GLOBAL_PATTERNS)
 ${params.globalPatterns}
 `);
+  }
+
+  // Optional: advertise queryable knowledge bases (graphify graphs).
+  // These are background corpora (design docs, runbooks, glossaries) that pi
+  // can consult on demand — NOT injected directly to keep the prompt small.
+  // Each library carries `keywords` so pi can route a query to the right one
+  // based on diff content (architecture concept → design_docs, API change →
+  // apidocs, risk assessment → bug archives, etc.).
+  if (params.knowledgeBases && params.knowledgeBases.length > 0) {
+    const lines: string[] = [];
+    lines.push("## 可用知识库 (graphify)");
+    lines.push("");
+    lines.push("以下知识库已构建语义图谱。**仅在分析需要外部背景知识时**主动调用，每个库针对不同问题：");
+    lines.push("");
+    lines.push("| 知识库 | 适用问题 | 触发关键词 |");
+    lines.push("|---|---|---|");
+    for (const kb of params.knowledgeBases) {
+      const kw = kb.keywords.length > 0 ? kb.keywords.join("、") : "（无）";
+      // Escape pipe in description to keep table valid.
+      const desc = kb.description.replace(/\|/g, "\\|");
+      lines.push(`| \`${kb.name}\` | ${desc} | ${kw} |`);
+    }
+    lines.push("");
+    lines.push("**调用方式：**");
+    lines.push("```bash");
+    lines.push('graphify query "<concept-or-question>" --graph <graph-path> --budget 1500');
+    lines.push("```");
+    lines.push("");
+    lines.push("**graph-path 取值：**");
+    for (const kb of params.knowledgeBases) {
+      lines.push(`- \`${kb.name}\` → \`${kb.graphPath}\``);
+    }
+    lines.push("");
+    lines.push("**路由策略（按 diff 内容匹配）：**");
+    lines.push("1. diff 涉及陌生模块/想了解架构决策 → `cvm_design_docs`");
+    lines.push("2. diff 涉及业务概念（实例规格、镜像、计费、资源池）→ `cvm_domain`");
+    lines.push("3. diff 修改对外 API 入参/返回/错误码 → `cvm_apidocs`");
+    lines.push("4. 评估发布期风险、查历史故障 → `cvm_released_bugs`");
+    lines.push("5. 查日常迭代相似 bug、同类需求 → `cvm_tapd_bugs`");
+    lines.push("");
+    lines.push("**调用约束：**");
+    lines.push("- 每次查询消耗约 1500 token；每个分析任务建议 ≤ 3 次查询");
+    lines.push("- 同一概念只查最相关的一个库，不要广撒网");
+    lines.push("- 若 diff + AGENTS.md 已足够，**无需查询**");
+    lines.push("");
+    parts.push(lines.join("\n"));
   }
 
   parts.push(`## 执行要求

@@ -45,6 +45,22 @@ export interface PipelineConfig {
   entryPointRepos?: string[];
   /** Sink repos — terminal/lowest-layer modules (DAO/DB/storage); downstream-chain convergence anchors */
   sinkRepos?: string[];
+  /**
+   * Knowledge bases pi can query on demand via `graphify query`. Built by the
+   * indexer's runGraphifyKnowledgeBases() and stored at
+   *   <workspaceDir>/.deepinsight/knowledge-graphs/<name>/graphify-out/graph.json
+   * for built-on-the-fly entries, or
+   *   <workspaceDir>/<repo>/<paths[0]>/graphify-out/graph.json
+   * for prebuilt entries that ship the graph inside the repo.
+   * Only entries whose graph.json exists at request time are exposed to pi.
+   */
+  knowledgeBases?: Array<{
+    name: string;
+    description: string;
+    /** Routing hints — pi matches diff content against these to pick which kb to query */
+    keywords: string[];
+    graphPath: string;
+  }>;
 }
 
 /**
@@ -55,6 +71,7 @@ export function loadPipelineConfig(): PipelineConfig {
   let excludeDirs: string[] = [];
   let entryPointRepos: string[] = [];
   let sinkRepos: string[] = [];
+  let knowledgeBases: Array<{ name: string; description: string; keywords: string[]; graphPath: string }> = [];
 
   try {
     const rawYaml = fs.readFileSync(projectConfigPath, "utf-8");
@@ -98,6 +115,63 @@ export function loadPipelineConfig(): PipelineConfig {
 
     entryPointRepos = [...entrySet];
     sinkRepos = [...sinkSet];
+
+    // Parse knowledge_base[] — only graphify entries with an existing
+    // graph.json are exposed to pi (otherwise the prompt would advertise a
+    // non-existent graph and pi would waste a tool call confirming).
+    //
+    // Two graph location strategies:
+    //   prebuilt: false → built daily by indexer, lives at
+    //     <workspace>/.deepinsight/knowledge-graphs/<name>/graphify-out/graph.json
+    //   prebuilt: true  → ships inside the repo, lives at
+    //     <workspace>/<repo>/<paths[0]>/graphify-out/graph.json
+    const workspaceDir = process.env.WORKSPACE_DIR ?? "/data/workspace";
+    const rawKbList = config.knowledge_base;
+    if (Array.isArray(rawKbList)) {
+      for (const item of rawKbList) {
+        if (typeof item !== "object" || item === null) continue;
+        const kb = item as Record<string, unknown>;
+        if (kb.type !== "graphify") continue;
+        if (typeof kb.name !== "string" || !kb.name) continue;
+
+        let graphPath: string;
+        if (kb.prebuilt === true) {
+          if (typeof kb.repo !== "string" || !kb.repo) {
+            console.log(`[config] knowledge_base '${kb.name}' prebuilt but no repo specified; skipping`);
+            continue;
+          }
+          // Use first path under the repo, or repo root if no paths declared.
+          const firstPath = Array.isArray(kb.paths) && kb.paths.length > 0 ? String(kb.paths[0]) : "";
+          graphPath = path.join(workspaceDir, kb.repo, firstPath, "graphify-out", "graph.json");
+        } else {
+          graphPath = path.join(
+            workspaceDir,
+            ".deepinsight",
+            "knowledge-graphs",
+            kb.name,
+            "graphify-out",
+            "graph.json",
+          );
+        }
+
+        if (!fs.existsSync(graphPath)) {
+          console.log(`[config] knowledge_base '${kb.name}' has no graph yet (${graphPath}); skipping`);
+          continue;
+        }
+        const keywords = Array.isArray(kb.keywords)
+          ? kb.keywords.map(String).filter(Boolean)
+          : [];
+        knowledgeBases.push({
+          name: kb.name,
+          description: typeof kb.description === "string" ? kb.description : "",
+          keywords,
+          graphPath,
+        });
+      }
+      if (knowledgeBases.length > 0) {
+        console.log(`[config] Loaded ${knowledgeBases.length} knowledge base(s): ${knowledgeBases.map(k => k.name).join(", ")}`);
+      }
+    }
   } catch (err) {
     // Differentiate "file missing" (expected on dev) vs "parse / read error"
     // (misconfigured deployment). Without this, a typo'd YAML would silently
@@ -135,6 +209,7 @@ export function loadPipelineConfig(): PipelineConfig {
     excludeDirs,
     entryPointRepos,
     sinkRepos,
+    knowledgeBases,
   };
 }
 
@@ -335,6 +410,7 @@ export async function runAnalysisPipeline(
     sinkRepos,
     agentsMd,
     globalPatterns,
+    knowledgeBases: config.knowledgeBases,
   };
 
   const step4Start = Date.now();
@@ -606,6 +682,7 @@ async function runSingleChange(
       sinkRepos,
       agentsMd,
       globalPatterns,
+      knowledgeBases: config.knowledgeBases,
     };
 
     const step4Start = Date.now();

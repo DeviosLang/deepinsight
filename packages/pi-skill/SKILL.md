@@ -7,6 +7,28 @@
 - diff 文件（patch 格式）
 - 相关仓库的 AGENTS.md（由分析服务注入上下文）
 - GLOBAL_PATTERNS.md（历史风险传播路径）
+- **可用知识库（可选）**：分析服务可能在 prompt 头部声明一个或多个 graphify 知识库。
+  prompt 会列出每个库的 `description` 和 `keywords` 作为路由提示：
+
+  | 典型路由 |
+  |---|
+  | `cvm_design_docs` — 架构决策、设计取舍、glossary |
+  | `cvm_domain` — 实例规格、镜像、计费等业务概念 |
+  | `cvm_apidocs` — 对外接口入参/返回/错误码 |
+  | `cvm_released_bugs` — 发布期 bug，用于风险评估 |
+  | `cvm_tapd_bugs` — 日常迭代 bug 与需求 |
+
+  这些是**按需检索**的背景语料，不会预先注入。若分析过程中遇到不熟悉的领域概念、
+  想确认架构决策原因、或评估改动对历史 bug 的影响，主动调用：
+
+  ```bash
+  graphify query "<concept-or-question>" --graph <graph-path> --budget 1500
+  ```
+
+  调用约束：
+  - 仅在 diff + AGENTS.md 不足以判断时才查；常见调用链/符号搜索仍优先用 grep/ast-grep
+  - 每次查询消耗约 1500 token，每个分析任务建议 ≤ 3 次
+  - 按 keywords 选最相关的**一个**库，不要广撒网（同一概念多库查会浪费 token）
 
 ## 分析步骤
 
