@@ -44,7 +44,8 @@ RUN npm install -g tsx
 # Install graphify (knowledge graph for documentation knowledge bases)
 # Used by indexer to build graph.json over knowledge_base[] entries in project.yml,
 # and by pi workers at analysis time via `graphify query` for on-demand retrieval.
-RUN pip install graphifyy --break-system-packages
+# The `openai` extra is required for the tokenhub custom provider (openai-compatible API).
+RUN pip install graphifyy "graphifyy[openai]" --break-system-packages
 
 # Register tokenhub as a graphify custom provider so the indexer can reuse the
 # existing LLM_ANALYSIS_API_KEY (mapped to TOKENHUB_API_KEY at runtime) without
