@@ -76,12 +76,70 @@ repos:
 # map form is still accepted for backward compatibility, but the list+role form
 # above is preferred.)
 
-# ── Knowledge Base (optional) ──
+# ── Knowledge Base (optional, multi-entry) ──
+# Declares external knowledge bases (design docs, runbooks, glossaries...) that
+# pi workers can query on demand at analysis time. Each entry is indexed into
+# its own graphify graph and exposed to pi via
+#   `graphify query "<question>" --graph <path> --budget 1500`.
+#
+# Routing: each entry advertises `description` + `keywords` so pi can decide
+# which (if any) library to consult based on diff content. Multi-library queries
+# are allowed but discouraged — pick the most relevant one per question.
+#
+# Two indexing modes:
+#   prebuilt: false (default) — indexer runs `graphify extract` daily and
+#     writes graph.json under /data/workspace/.deepinsight/knowledge-graphs/<name>/
+#   prebuilt: true — graph.json already lives inside the repo at <repo>/<paths>/graphify-out/graph.json
+#     (e.g. every_thing_cvm ships pre-built graphs); indexer skips extract and only verifies presence.
 knowledge_base:
-  repo: "<GIT_BASE_URL>/platform/ai-docs.git"
-  paths:
-    - "architecture/"
-    - "service-topology.md"
+  # Architecture / design decisions — built daily by the indexer
+  - name: "cvm_design_docs"
+    repo: "ai_docs"
+    type: "graphify"
+    paths:
+      - "cvm_docs_v2/"
+    description: "CVM 平台架构决策、设计文档、glossary、pitfalls"
+    keywords: ["架构", "设计决策", "design", "architecture", "glossary", "pitfall", "为什么"]
+
+  # Domain knowledge (instance specs, images, billing concepts) — pre-built
+  - name: "cvm_domain"
+    repo: "every_thing_cvm"
+    type: "graphify"
+    prebuilt: true
+    paths:
+      - "domain-base/"
+    description: "CVM 领域知识：实例规格、镜像类型、专有预扣资源池、计费等业务概念"
+    keywords: ["实例规格", "镜像", "计费", "资源池", "domain", "业务概念"]
+
+  # External API specs — pre-built
+  - name: "cvm_apidocs"
+    repo: "every_thing_cvm"
+    type: "graphify"
+    prebuilt: true
+    paths:
+      - "api-base/cvm/"
+    description: "CVM 对外接口文档（v20170312），含入参/返回/错误码"
+    keywords: ["API", "接口", "入参", "返回", "错误码", "v20170312"]
+
+  # Bugs found during release windows — pre-built
+  - name: "cvm_released_bugs"
+    repo: "every_thing_cvm"
+    type: "graphify"
+    prebuilt: true
+    paths:
+      - "released-base/"
+    description: "发布期间出现过的 bug 记录，按 release 单 ID 索引"
+    keywords: ["bug", "released", "发布", "回滚", "故障", "历史问题"]
+
+  # Bugs / requirements from daily iteration (TAPD) — pre-built
+  - name: "cvm_tapd_bugs"
+    repo: "every_thing_cvm"
+    type: "graphify"
+    prebuilt: true
+    paths:
+      - "tapd-base/"
+    description: "日常迭代版本 TAPD 上的 bug 与需求记录"
+    keywords: ["tapd", "迭代", "需求", "日常 bug", "缺陷"]
 
 # ── Internal Package Mapping ──
 internal_packages:

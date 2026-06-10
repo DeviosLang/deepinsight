@@ -12,7 +12,7 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 600
+      activeDeadlineSeconds: 7200
       template:
         spec:
           restartPolicy: Never
@@ -28,6 +28,19 @@ spec:
                   value: Asia/Shanghai
                 - name: PROJECT_CONFIG_PATH
                   value: "/etc/deepinsight/project.yml"
+                # LLM_ANALYSIS_API_KEY: indexer fallback when graphify env not set
+                # TOKENHUB_API_KEY: read directly by graphify (custom provider)
+                # Both bound to same secret — single source of truth.
+                - name: LLM_ANALYSIS_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: deepinsight-secrets
+                      key: llm-api-key
+                - name: TOKENHUB_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: deepinsight-secrets
+                      key: llm-api-key
               volumeMounts:
                 - name: workspace
                   mountPath: /data/workspace

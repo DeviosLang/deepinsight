@@ -40,6 +40,27 @@ interface RepoEntry {
   tags?: string[];
 }
 
+interface KnowledgeBaseEntry {
+  /** Unique id; becomes the directory name under .deepinsight/knowledge-graphs/ */
+  name: string;
+  /** Workspace dir under WORKSPACE_DIR (e.g. "ai_docs") */
+  repo: string;
+  /** Indexer type — currently only "graphify" is implemented */
+  type: string;
+  /** Subset paths relative to repo root; empty/missing = whole repo */
+  paths?: string[];
+  /** Human description shown to pi at analysis time */
+  description?: string;
+  /** Routing hints (Chinese + English) — pi matches diff content against these */
+  keywords?: string[];
+  /**
+   * If true, the graph.json already lives at <repo>/<paths[0]>/graphify-out/graph.json
+   * (e.g. every_thing_cvm ships pre-built graphs). Indexer skips `graphify extract`
+   * and only verifies the file exists. Default: false.
+   */
+  prebuilt?: boolean;
+}
+
 interface ProjectConfig {
   repos: RepoEntry[];
   runtime_calls?: {
@@ -50,6 +71,7 @@ interface ProjectConfig {
     high_risk_dirs?: string[];
     api_dirs?: string[];
   };
+  knowledge_base?: KnowledgeBaseEntry[];
 }
 
 function loadProjectConfig(): ProjectConfig | null {
@@ -350,6 +372,127 @@ function generateAgentsMd(repoPath: string, repoConfig: RepoEntry | null, projec
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+/**
+ * Build/refresh graphify knowledge graphs for every `knowledge_base[]` entry
+ * with `type: graphify`. Output lands at:
+ *   <WORKSPACE_DIR>/.deepinsight/knowledge-graphs/<entry.name>/graphify-out/graph.json
+ *
+ * Behaviour:
+ *   - Existing graph.json → incremental `--update` (only changed files re-extracted)
+ *   - No graph.json yet → full extract
+ *   - Failure for one entry is logged and SKIPPED (other entries still run)
+ *
+ * The graph.json is what pi consumes via `graphify query` at analysis time.
+ * GRAPH_REPORT.md is intentionally NOT generated here (--no-cluster):
+ *   1. The full report can exceed the prompt budget for large corpora.
+ *   2. Community labelling against tokenhub currently returns malformed JSON,
+ *      so we skip it; pi calls `graphify query` for navigation instead.
+ */
+function runGraphifyKnowledgeBases(config: ProjectConfig | null): void {
+  const kbList = config?.knowledge_base ?? [];
+  if (kbList.length === 0) {
+    console.log("[indexer] No knowledge_base entries declared; skipping graphify step");
+    return;
+  }
+
+  // Auth: graphify reads TOKENHUB_API_KEY for the custom provider registered
+  // in the Docker image (~/.graphify/providers.json). We map the existing
+  // LLM_ANALYSIS_API_KEY through here so deployments don't need a second secret.
+  const llmKey = process.env.TOKENHUB_API_KEY ?? process.env.LLM_ANALYSIS_API_KEY;
+  if (!llmKey) {
+    console.warn("[indexer] Neither TOKENHUB_API_KEY nor LLM_ANALYSIS_API_KEY set; skipping graphify step");
+    return;
+  }
+
+  const outBase = path.join(WORKSPACE_DIR, ".deepinsight", "knowledge-graphs");
+  fs.mkdirSync(outBase, { recursive: true });
+
+  for (const kb of kbList) {
+    if (kb.type !== "graphify") {
+      console.log(`[indexer]   skip kb '${kb.name}': type=${kb.type} not implemented`);
+      continue;
+    }
+    if (!kb.name || !kb.repo) {
+      console.warn(`[indexer]   skip kb: missing name/repo (${JSON.stringify(kb)})`);
+      continue;
+    }
+
+    const repoPath = path.join(WORKSPACE_DIR, kb.repo);
+    if (!fs.existsSync(repoPath)) {
+      console.warn(`[indexer]   skip kb '${kb.name}': repo dir ${repoPath} not found`);
+      continue;
+    }
+
+    // Scan root: first declared path under the repo, or the repo root itself.
+    // Multi-path corpora aren't supported in one graph — declare a separate
+    // knowledge_base entry per logical scope (see example.template.yml).
+    const scanRoot = (kb.paths && kb.paths.length > 0)
+      ? path.join(repoPath, kb.paths[0])
+      : repoPath;
+    if (!fs.existsSync(scanRoot)) {
+      console.warn(`[indexer]   skip kb '${kb.name}': scan root ${scanRoot} not found`);
+      continue;
+    }
+
+    // Prebuilt graphs (e.g. every_thing_cvm ships graphify-out/ inside the
+    // repo) — just verify the graph.json exists; skip extract entirely.
+    if (kb.prebuilt) {
+      const inRepoGraph = path.join(scanRoot, "graphify-out", "graph.json");
+      if (fs.existsSync(inRepoGraph)) {
+        const stat = fs.statSync(inRepoGraph);
+        console.log(
+          `[indexer]   ✓ ${kb.name} (prebuilt, ${(stat.size / 1024).toFixed(1)} KB) — using ${inRepoGraph}`,
+        );
+      } else {
+        console.warn(
+          `[indexer]   ✗ ${kb.name} declared prebuilt but graph.json missing at ${inRepoGraph}`,
+        );
+      }
+      continue;
+    }
+
+    const outDir = path.join(outBase, kb.name);
+    fs.mkdirSync(outDir, { recursive: true });
+
+    const existingGraph = path.join(outDir, "graphify-out", "graph.json");
+    const isUpdate = fs.existsSync(existingGraph);
+
+    const args = [
+      "extract", scanRoot,
+      "--backend", "tokenhub",
+      "--out", outDir,
+      "--no-cluster",
+      "--max-concurrency", "4",
+    ];
+    if (isUpdate) {
+      // graphify reuses cache/ under graphify-out/ to skip unchanged files;
+      // no separate flag needed for incremental — re-running on the same --out
+      // dir is itself the update path.
+    }
+
+    console.log(
+      `[indexer] graphify ${kb.name}: ${scanRoot} → ${outDir}${isUpdate ? " (incremental)" : " (initial)"}`,
+    );
+    const t0 = Date.now();
+    const result = spawnSync("graphify", args, {
+      stdio: "inherit",
+      timeout: 60 * 60 * 1000, // 60 min ceiling — large corpora can run long
+      env: {
+        ...process.env,
+        TOKENHUB_API_KEY: llmKey,
+      },
+    });
+    const dt = ((Date.now() - t0) / 1000).toFixed(1);
+    if (result.status !== 0) {
+      console.warn(
+        `[indexer]   ✗ graphify ${kb.name} exit ${result.status}${result.error ? ` (${result.error.message})` : ""} after ${dt}s`,
+      );
+    } else {
+      console.log(`[indexer]   ✓ graphify ${kb.name} done in ${dt}s`);
+    }
+  }
+}
+
 function main(): void {
   console.log(`[indexer] Workspace: ${WORKSPACE_DIR}`);
   console.log(`[indexer] Config: ${CONFIG_PATH}`);
@@ -404,6 +547,17 @@ function main(): void {
   }
 
   console.log(`\n[indexer] Done. Generated ${generated}/${repos.length} AGENTS.md files in ${OUTPUT_DIR}`);
+
+  // Build/refresh knowledge-base graphs (graphify). Failures here don't fail
+  // the AGENTS.md run — knowledge graphs are an optional enrichment.
+  console.log(`\n[indexer] === Knowledge base graphify step ===`);
+  try {
+    runGraphifyKnowledgeBases(projectConfig);
+  } catch (err) {
+    console.error(
+      `[indexer] graphify step crashed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 }
 
 main();

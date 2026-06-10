@@ -28,6 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     jq \
     ca-certificates \
+    python3 \
+    python3-pip \
   && rm -rf /var/lib/apt/lists/*
 
 # Install ast-grep
@@ -38,6 +40,25 @@ RUN npm install -g @earendil-works/pi-coding-agent
 
 # Install tsx (for running indexer scripts)
 RUN npm install -g tsx
+
+# Install graphify (knowledge graph for documentation knowledge bases)
+# Used by indexer to build graph.json over knowledge_base[] entries in project.yml,
+# and by pi workers at analysis time via `graphify query` for on-demand retrieval.
+RUN pip install graphifyy --break-system-packages
+
+# Register tokenhub as a graphify custom provider so the indexer can reuse the
+# existing LLM_ANALYSIS_API_KEY (mapped to TOKENHUB_API_KEY at runtime) without
+# needing a separate API key. The base_url matches the rest of the service.
+RUN mkdir -p /root/.graphify && printf '%s\n' \
+    '{' \
+    '  "tokenhub": {' \
+    '    "base_url": "https://tokenhub.tencentmaas.com/v1",' \
+    '    "default_model": "deepseek-v4-pro",' \
+    '    "env_key": "TOKENHUB_API_KEY",' \
+    '    "pricing": {"input": 0.0, "output": 0.0}' \
+    '  }' \
+    '}' \
+    > /root/.graphify/providers.json
 
 RUN corepack enable && corepack prepare pnpm@9.12.0 --activate
 
