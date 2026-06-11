@@ -476,7 +476,7 @@ function runGraphifyKnowledgeBases(config: ProjectConfig | null): void {
     const t0 = Date.now();
     const result = spawnSync("graphify", args, {
       stdio: "inherit",
-      timeout: 60 * 60 * 1000, // 60 min ceiling — large corpora can run long
+      timeout: 4 * 60 * 60 * 1000, // 4h ceiling — large corpora (1000+ docs) can take 2-3h
       env: {
         ...process.env,
         TOKENHUB_API_KEY: llmKey,

@@ -12,7 +12,7 @@ spec:
   failedJobsHistoryLimit: 3
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 7200
+      activeDeadlineSeconds: 14400
       template:
         spec:
           restartPolicy: Never
