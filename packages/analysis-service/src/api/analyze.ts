@@ -252,6 +252,56 @@ function isValidPersistedTask(obj: unknown): boolean {
 // Load on startup
 loadTasksFromDisk();
 
+// Pod identifier surfaced in responses via the `X-Pod-Name` header so callers
+// can detect which replica answered. Essential for debugging multi-Pod
+// inconsistency: when GET returns stale state, the header tells you which
+// Pod's in-memory cache went out of sync with NFS. K8s sets HOSTNAME to the
+// Pod name; outside K8s falls back to OS hostname, then "unknown".
+const POD_NAME = process.env.HOSTNAME ?? process.env.POD_NAME ?? "unknown";
+
+/**
+ * Resolve the freshest task view for a GET request.
+ *
+ * Failure mode this guards against:
+ *   1. Pod A loads task X from NFS at startup while X.status === "running"
+ *      (its owner is Pod B, mid-pipeline).
+ *   2. Pod B finishes task X, writes NFS with status === "completed".
+ *   3. GET hits Pod A → tasks.get(taskId) returns the stale "running" copy
+ *      from step 1; the disk fallback is skipped because in-memory hit.
+ *      → Caller sees "running" forever even though NFS has the final result.
+ *
+ * Fix: when in-memory state is non-terminal (queued/running), cross-check
+ * NFS. If NFS is terminal (completed/failed), adopt the NFS version and
+ * refresh in-memory so subsequent GETs to this Pod stay consistent.
+ *
+ * Cost: one extra `fs.readFileSync` per GET when status isn't terminal.
+ * Acceptable — the file is < 100 KB and lives on NFS that's already cached
+ * by the kernel. The terminal-state check ensures completed tasks (the hot
+ * path) never pay this cost.
+ */
+function getFreshestTask(taskId: string): AnalysisTask | null {
+  const inMemory = tasks.get(taskId);
+  if (!inMemory) {
+    return readTaskFromDisk(taskId);
+  }
+  // Terminal state — in-memory was written by this Pod's own pipeline, trust it.
+  if (inMemory.status === "completed" || inMemory.status === "failed") {
+    return inMemory;
+  }
+  // Non-terminal in-memory — could be a stale snapshot from startup. Check NFS.
+  const onDisk = readTaskFromDisk(taskId);
+  if (
+    onDisk &&
+    (onDisk.status === "completed" || onDisk.status === "failed") &&
+    onDisk.completedAt
+  ) {
+    // NFS has the terminal version — adopt it and refresh local cache.
+    tasks.set(taskId, onDisk);
+    return onDisk;
+  }
+  return inMemory;
+}
+
 interface AnalyzeBody {
   project: string;
   changes: ChangeSpec[];
@@ -307,10 +357,13 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
     "/analyze/:taskId",
     async (req, reply) => {
       const { taskId } = req.params;
+      // Always surface which Pod answered — invaluable for debugging multi-Pod
+      // inconsistency. Set BEFORE any early return so 404s also carry it.
+      reply.header("X-Pod-Name", POD_NAME);
       // Memory first (this Pod's own running tasks have the freshest state).
-      // Fall back to NFS for tasks owned by other Pods in multi-replica
-      // deployments, or for tasks evicted from the in-memory LRU.
-      const task = tasks.get(taskId) ?? readTaskFromDisk(taskId);
+      // Cross-check NFS when in-memory state is non-terminal — see
+      // getFreshestTask docstring for the failure mode this guards.
+      const task = getFreshestTask(taskId);
 
       if (!task) {
         return reply.status(404).send({ error: "Task not found" });
@@ -371,6 +424,7 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
 
   // List all tasks (summary view, no full result payload)
   app.get("/tasks", async (req, reply) => {
+    reply.header("X-Pod-Name", POD_NAME);
     const query = req.query as Record<string, string>;
     const limit = Math.min(Number(query.limit) || 50, 200);
     const status = query.status; // optional filter: queued|running|completed|failed

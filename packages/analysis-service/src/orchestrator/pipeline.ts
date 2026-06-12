@@ -15,7 +15,7 @@ import { RepoManager } from "../repo/repoManager.js";
 import { coarseFilter, fineFilter } from "../pre-filter/index.js";
 import { runPiWorker, runPiWorkerWithRetry, buildAnalysisPrompt, extractJsonFromOutput } from "./piWorker.js";
 import { prefetchKnowledgeBases } from "./kbPrefetch.js";
-import type { PiWorkerConfig } from "./piWorker.js";
+import type { PiWorkerConfig, PiWorkerResult } from "./piWorker.js";
 import type { Symbol } from "../pre-filter/index.js";
 import {
   startTrace,
@@ -26,6 +26,8 @@ import {
   recordLlmFailure,
   isInDegradedMode,
 } from "../observability/trace.js";
+import { lintCrossRepoImpact, isLintEnabled, DRIFT_HEAVY_THRESHOLD } from "./schemaLint.js";
+import type { LintResult } from "./schemaLint.js";
 
 export interface PipelineConfig {
   workspaceDir: string;
@@ -237,8 +239,8 @@ export async function runAnalysisPipeline(
 
   // Single change — run directly
   if (task.changes.length === 1) {
-    const result = await runSingleChange(task, task.changes[0], config, repoManager, traceCtx);
-    flushTrace(traceCtx, task, undefined).catch(() => {});
+    const { result, piResult } = await runSingleChange(task, task.changes[0], config, repoManager, traceCtx);
+    flushTrace(traceCtx, task, piResult ?? undefined).catch(() => {});
     return result;
   }
 
@@ -304,18 +306,90 @@ export async function runAnalysisPipeline(
 
   console.log(`[pipeline:${task.taskId}] Combined: ${resolvedChanges.length} repos, ${allSymbols.length} symbols, ${combinedDiff.length} chars diff`);
 
-  // Guard: if too many symbols, fall back to independent mode
-  if (allSymbols.length > 30) {
-    console.log(`[pipeline:${task.taskId}] Too many symbols (${allSymbols.length} > 30), falling back to independent mode`);
+  // Guard: dual-gate fallback to independent mode (P0-B)
+  //
+  // Old behaviour (single gate): allSymbols.length > 30 → fallback.
+  //   Treated "5 repos × 6 symbols" identical to "1 repo × 30 symbols" — way too
+  //   conservative. The failure mode of joint mode is "single repo's diff blows
+  //   up the prompt", NOT "many small repos combined". Total symbol count is a
+  //   weak proxy for prompt size.
+  //
+  // New behaviour (dual gate): fallback iff
+  //   maxSingleRepoSymbols > JOINT_MODE_SINGLE_REPO_LIMIT (default 30) — guards
+  //                                                                    prompt-size blow-up
+  //   OR allSymbols.length > JOINT_MODE_TOTAL_LIMIT (default 80) — overall cap
+  //
+  // Effect: 5 repos × 6 symbols = 30 total now stays in joint mode (~2× faster
+  // and ~60% cheaper LLM tokens since the diff is read once, not 5 times).
+  // Large single repos (cvm_api 128 symbols) still fall back, unchanged.
+  //
+  // Rollback: set JOINT_MODE_TOTAL_LIMIT=30 and JOINT_MODE_SINGLE_REPO_LIMIT=30
+  // via env to restore old single-gate behaviour without redeploy.
+  const jointSingleRepoLimit = Math.max(
+    1,
+    parseInt(process.env.JOINT_MODE_SINGLE_REPO_LIMIT ?? "30", 10) || 30,
+  );
+  const jointTotalLimit = Math.max(
+    jointSingleRepoLimit,
+    parseInt(process.env.JOINT_MODE_TOTAL_LIMIT ?? "80", 10) || 80,
+  );
+  const maxSingleRepoSymbols = resolvedChanges.reduce(
+    (m, rc) => (rc.symbols.length > m ? rc.symbols.length : m),
+    0,
+  );
+  const exceedsSingle = maxSingleRepoSymbols > jointSingleRepoLimit;
+  const exceedsTotal = allSymbols.length > jointTotalLimit;
+
+  if (exceedsSingle || exceedsTotal) {
+    const reason = exceedsSingle
+      ? `single repo has ${maxSingleRepoSymbols} symbols > ${jointSingleRepoLimit}`
+      : `total ${allSymbols.length} symbols > ${jointTotalLimit}`;
+    console.log(
+      `[pipeline:${task.taskId}] Falling back to independent mode: ${reason} (limits: single=${jointSingleRepoLimit}, total=${jointTotalLimit})`,
+    );
     const results: Array<AnalysisResult | null> = [];
+    // Track the LAST piResult across iterations — independent-mode fallback
+    // runs each change separately; we attribute the trace to the most recent
+    // run (typical case: one change drives the analysis, others are tiny).
+    let lastPiResult: PiWorkerResult | null = null;
     for (const rc of resolvedChanges) {
-      const result = await runSingleChange(task, rc.change, config, repoManager, traceCtx);
+      const { result, piResult } = await runSingleChange(task, rc.change, config, repoManager, traceCtx);
       results.push(result);
+      if (piResult) lastPiResult = piResult;
     }
     const validResults = results.filter((r): r is AnalysisResult => r !== null);
     if (validResults.length === 0) return null;
     const merged = validResults.length === 1 ? validResults[0] : mergeMultiChangeResults(validResults);
-    flushTrace(traceCtx, task, undefined).catch(() => {});
+
+    // Aggregate per-repo schemaLint summaries into the merged result's _meta.
+    // mergeMultiChangeResults only combines business fields; _meta is dropped.
+    // Re-aggregate here so the merged result carries the full drift picture.
+    const mergedMeta = (merged as unknown as Record<string, unknown>)._meta as Record<string, unknown> | undefined;
+    const lintSummaries = validResults
+      .map((r) => ((r as unknown as Record<string, unknown>)._meta as Record<string, unknown> | undefined)?.schemaLint)
+      .filter(Boolean) as Array<{ warningCount: number; categories: Record<string, number>; driftHeavy: boolean }>;
+    if (lintSummaries.length > 0) {
+      const totalWarnings = lintSummaries.reduce((s, l) => s + (l.warningCount ?? 0), 0);
+      const mergedCategories: Record<string, number> = {};
+      for (const l of lintSummaries) {
+        for (const [k, v] of Object.entries(l.categories ?? {})) {
+          mergedCategories[k] = (mergedCategories[k] ?? 0) + v;
+        }
+      }
+      (merged as unknown as Record<string, unknown>)._meta = {
+        ...(mergedMeta ?? {}),
+        independentMode: true,
+        repoCount: validResults.length,
+        schemaLint: {
+          warningCount: totalWarnings,
+          categories: mergedCategories,
+          driftHeavy: totalWarnings >= DRIFT_HEAVY_THRESHOLD,
+          perRepo: lintSummaries.length,
+        },
+      };
+    }
+
+    flushTrace(traceCtx, task, lastPiResult ?? undefined).catch(() => {});
     return merged;
   }
 
@@ -405,6 +479,8 @@ export async function runAnalysisPipeline(
   task.progress = { step: 4, stepName: "联合 AI 分析中", reposScanned: finalTargetRepos.size, reposTotal: targetRepos.length };
 
   if (isInDegradedMode()) {
+    // Degraded mode skips pi entirely → no piResult to attribute. Flush the
+    // pipeline-stage spans we did record so the trace still has shape.
     flushTrace(traceCtx, task, undefined).catch(() => {});
     return null;
   }
@@ -488,19 +564,21 @@ export async function runAnalysisPipeline(
   const piOutput = piResult.output ?? "";
   const jsonResult = extractJsonFromOutput(piOutput);
   if (jsonResult && isValidAnalysisResult(jsonResult)) {
+    const lint = applySchemaLint(jsonResult as Record<string, unknown>, task.taskId, "joint");
     (jsonResult as Record<string, unknown>)._meta = {
       durationMs: piResult.durationMs,
       jointMode: true,
       changes: resolvedChanges.map((rc) => rc.change.repo),
+      ...(lint ? { schemaLint: summarizeLint(lint) } : {}),
     };
-    flushTrace(traceCtx, task, undefined).catch(() => {});
+    flushTrace(traceCtx, task, piResult).catch(() => {});
     return jsonResult as unknown as AnalysisResult;
   }
 
   // Fallback — emit a minimal cross-repo-impact/2.0 skeleton so downstream
   // consumers don't crash on missing schema_version. The renderer treats
   // _rawOutput as the partial-output banner.
-  flushTrace(traceCtx, task, undefined).catch(() => {});
+  flushTrace(traceCtx, task, piResult).catch(() => {});
   return buildFallbackArtifact({
     changes: resolvedChanges.map((rc) => rc.change),
     symbols: allSymbols.map((s) => ({
@@ -515,6 +593,12 @@ export async function runAnalysisPipeline(
 
 /**
  * Analyze a single change (one repo/branch). Extracted to support multi-change mode.
+ *
+ * Returns both the structured result AND the raw piResult so the caller can
+ * attribute the trace correctly — flushTrace needs the piResult for token /
+ * cost / tool-event attribution. We split the responsibilities so the trace
+ * is always flushed exactly once at the top level, regardless of which
+ * caller path produced the result.
  */
 async function runSingleChange(
   task: AnalysisTask,
@@ -522,7 +606,7 @@ async function runSingleChange(
   config: PipelineConfig,
   repoManager: RepoManager,
   traceCtx: ReturnType<typeof startTrace>,
-): Promise<AnalysisResult | null> {
+): Promise<{ result: AnalysisResult | null; piResult: PiWorkerResult | null }> {
   // ─── Step 0: Resolve branch reference ───────────────────────────────────────
   if (change.branch && !change.commit) {
     console.log(`[pipeline:${task.taskId}] Step 0: Resolving branch ${change.branch} for ${change.repo}`);
@@ -542,7 +626,7 @@ async function runSingleChange(
       }
     } else {
       task.error = `无法 fetch 分支 ${change.branch}（仓库: ${change.repo}）`;
-      return null;
+      return { result: null, piResult: null };
     }
   }
 
@@ -554,7 +638,7 @@ async function runSingleChange(
   const diff = getDiff(repoManager, change, config.excludeDirs);
   if (!diff) {
     task.error = `无法获取 ${change.repo} 的 diff`;
-    return null;
+    return { result: null, piResult: null };
   }
   recordSpan(traceCtx, "step1_getDiff", step1Start, {
     repo: change.repo,
@@ -572,7 +656,7 @@ async function runSingleChange(
   const symbols = extractSymbolsFromDiff(diff);
   if (symbols.length === 0) {
     task.error = "diff 中未发现可分析的符号变更";
-    return null;
+    return { result: null, piResult: null };
   }
   recordSpan(traceCtx, "step2_extractSymbols", step2Start, {
     symbolCount: symbols.length,
@@ -811,6 +895,7 @@ async function runSingleChange(
   // when the LLM hallucinates structure. Without this guard, downstream
   // consumers crash on `result.summary.riskBreakdown.P0` etc.
   if (jsonResult && isValidAnalysisResult(jsonResult)) {
+    const lint = applySchemaLint(jsonResult as Record<string, unknown>, task.taskId, "single");
     // Add metadata about the analysis run
     (jsonResult as Record<string, unknown>)._meta = {
       durationMs: piResult?.durationMs,
@@ -819,8 +904,9 @@ async function runSingleChange(
       timedOut: piResult ? !piResult.success && piResult.error?.includes("timeout") : false,
       degraded: isInDegradedMode(),
       changeRepo: change.repo,
+      ...(lint ? { schemaLint: summarizeLint(lint) } : {}),
     };
-    return jsonResult as unknown as AnalysisResult;
+    return { result: jsonResult as unknown as AnalysisResult, piResult };
   }
 
   if (jsonResult) {
@@ -833,16 +919,19 @@ async function runSingleChange(
   const isTimeout = piResult ? (!piResult.success || (piResult.durationMs ?? 0) >= 895_000) : false;
   console.log(`[pipeline:${task.taskId}] Step 5: No JSON block found in output (${piOutput.length} chars, timeout=${isTimeout}). Returning raw partial result.`);
 
-  return buildFallbackArtifact({
-    changes: [change],
-    symbols: symbols.map((s) => ({
-      name: s.name,
-      location: change.repo,
-      diff_semantic: "见原始输出",
-      initial_severity: "medium" as const,
-    })),
-    rawOutput: piOutput,
-  }) as unknown as AnalysisResult;
+  return {
+    result: buildFallbackArtifact({
+      changes: [change],
+      symbols: symbols.map((s) => ({
+        name: s.name,
+        location: change.repo,
+        diff_semantic: "见原始输出",
+        initial_severity: "medium" as const,
+      })),
+      rawOutput: piOutput,
+    }) as unknown as AnalysisResult,
+    piResult,
+  };
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -866,6 +955,59 @@ function mergeMultiChangeResults(results: AnalysisResult[]): AnalysisResult {
 
 const REQUIRED_RISK_KEYS: ReadonlyArray<RiskLevel> = ["P0", "P1", "P2", "P3", "NEEDS_HUMAN_REVIEW"];
 const NEW_SCHEMA_VERSION_PATTERN = /^cross-repo-impact\/2\.\d+$/;
+
+/**
+ * Run schemaLint over a freshly-parsed pi artifact, log a one-line summary,
+ * and return the LintResult so callers can fold its summary into _meta.
+ *
+ * Returns null when the lint feature flag is off (DEEPINSIGHT_SCHEMA_LINT=off)
+ * — caller treats that as "no lint metadata to attach". The artifact is still
+ * mutated in place when lint runs, so downstream consumers always see the
+ * normalized shape regardless of whether _meta records the warning count.
+ */
+function applySchemaLint(
+  artifact: Record<string, unknown>,
+  taskId: string,
+  mode: "single" | "joint",
+): LintResult | null {
+  if (!isLintEnabled()) return null;
+  const lint = lintCrossRepoImpact(artifact);
+  if (lint.warnings.length === 0) {
+    console.log(`[pipeline:${taskId}] schemaLint(${mode}): clean (0 warnings)`);
+    return lint;
+  }
+
+  const heavy = lint.warnings.length >= DRIFT_HEAVY_THRESHOLD;
+  const topCats = Object.entries(lint.categories)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(", ");
+  console.log(
+    `[pipeline:${taskId}] schemaLint(${mode}): ${lint.warnings.length} warnings${heavy ? " [DRIFT-HEAVY]" : ""} — top: ${topCats}`,
+  );
+  return lint;
+}
+
+/**
+ * Compress LintResult into a small object suitable for _meta / Opik metadata.
+ * Keeps full warnings array for debugging but trims path strings if the artifact
+ * is huge — most consumers only read counts.
+ */
+function summarizeLint(lint: LintResult): Record<string, unknown> {
+  return {
+    warningCount: lint.warnings.length,
+    categories: lint.categories,
+    driftHeavy: lint.warnings.length >= DRIFT_HEAVY_THRESHOLD,
+    // First 30 warnings inline; the rest just by category counts (avoid blowing up _meta size)
+    sampleWarnings: lint.warnings.slice(0, 30).map((w) => ({
+      category: w.category,
+      path: w.path,
+      message: w.message,
+    })),
+    truncatedWarnings: Math.max(0, lint.warnings.length - 30),
+  };
+}
 
 /** Read a symbol's call_tree, falling back to legacy callTree. */
 function getCallTree(sym: Record<string, unknown>): unknown[] {
@@ -1322,6 +1464,12 @@ function mergeParallelPiResults(
   const totalToolCalls = successful.reduce((sum, r) => sum + (r.toolCallCount ?? 0), 0);
   const totalTurns = successful.reduce((sum, r) => sum + (r.turnCount ?? 0), 0);
   const maxDuration = Math.max(...successful.map((r) => r.durationMs));
+  // Concatenate all workers' tool events for the sub-span trace. Workers ran
+  // in parallel so the timeline is interleaved by startTime — sort to keep
+  // Opik's left-to-right rendering monotonic.
+  const mergedToolEvents = successful
+    .flatMap((r) => r.toolEvents ?? [])
+    .sort((a, b) => a.startTime - b.startTime);
 
   return {
     success: successful.some((r) => r.success),
@@ -1330,6 +1478,7 @@ function mergeParallelPiResults(
     usage: { inputTokens: totalInput, outputTokens: totalOutput },
     toolCallCount: totalToolCalls,
     turnCount: totalTurns,
+    toolEvents: mergedToolEvents,
     error: successful.filter((r) => !r.success).map((r) => r.error).join("; ") || undefined,
   };
 }

@@ -49,12 +49,71 @@ export interface PiWorkerResult {
   toolCallCount?: number;
   /** Number of turns */
   turnCount?: number;
+  /**
+   * Per-tool execution records — emitted under `tool_execution_start/end`.
+   * Used by observability/trace.ts to publish sub-spans under the piWorker
+   * span so the Opik trace tree shows what each pi turn actually did
+   * (graphify queries, grep, file reads, etc.).
+   *
+   * `endTime` is undefined when the worker was killed mid-tool (timeout/abort);
+   * the trace flusher should treat those as `endTime = Date.now()` and tag
+   * them as truncated.
+   */
+  toolEvents?: ToolEvent[];
+}
+
+export interface ToolEvent {
+  /** Tool name as reported by pi (e.g. "Bash", "Read", "graphify_query") */
+  tool: string;
+  /** ms since epoch */
+  startTime: number;
+  /** ms since epoch — undefined if process was killed before tool_execution_end */
+  endTime?: number;
+  /** Turn this tool ran in (1-based, matches turn_start counter) */
+  turn: number;
+  /** Optional short summary of the tool input (truncated) for span metadata */
+  inputPreview?: string;
 }
 
 /** Represents a single event from pi's JSON event stream */
 interface PiEvent {
   type: string;
+  __inflightKey?: string;
   [key: string]: unknown;
+}
+
+/**
+ * Build a short, span-friendly summary of a tool_execution_start payload.
+ * pi reports tool inputs differently per tool (Bash → command, Read → file_path,
+ * graphify_query → query); we sniff the common shapes and truncate aggressively
+ * — these strings end up in Opik span metadata, which has tight size limits.
+ */
+function summarizeToolInput(event: PiEvent): string | undefined {
+  const candidates: Array<unknown> = [
+    (event as Record<string, unknown>).command,
+    (event as Record<string, unknown>).query,
+    (event as Record<string, unknown>).file_path,
+    (event as Record<string, unknown>).path,
+    (event as Record<string, unknown>).pattern,
+    (event as Record<string, unknown>).input,
+    (event as Record<string, unknown>).args,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0) {
+      return c.length > 200 ? c.slice(0, 200) + "…" : c;
+    }
+  }
+  // Fallback: stringify the input object minus noisy fields
+  const inp = (event as Record<string, unknown>).toolInput ?? (event as Record<string, unknown>).input;
+  if (inp && typeof inp === "object") {
+    try {
+      const json = JSON.stringify(inp);
+      return json.length > 200 ? json.slice(0, 200) + "…" : json;
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -138,6 +197,14 @@ export async function runPiWorker(
     let toolCallCount = 0;
     let turnCount = 0;
     let usage: PiWorkerResult["usage"];
+    /**
+     * In-flight tool executions by tool name. pi reports start/end as separate
+     * events; we pair them up here. If a tool starts but never ends (process
+     * killed mid-call), the entry stays in toolEvents with endTime=undefined
+     * — flushTrace can then tag the span as truncated.
+     */
+    const toolEvents: ToolEvent[] = [];
+    const inflightTools = new Map<string, ToolEvent>();
     let resolved = false;
     let killTimer: ReturnType<typeof setTimeout> | null = null;
     let promptSent = false;
@@ -285,10 +352,41 @@ export async function runPiWorker(
 
           case "tool_execution_start":
             toolCallCount++;
+            {
+              const toolName = typeof event.toolName === "string" ? event.toolName : "unknown";
+              const inputPreview = summarizeToolInput(event);
+              const evt: ToolEvent = {
+                tool: toolName,
+                startTime: Date.now(),
+                turn: Math.max(turnCount, 1),
+                inputPreview,
+              };
+              toolEvents.push(evt);
+              // Use a key per (tool,index) so concurrent tool calls (rare but
+              // possible if pi parallelizes) don't clobber each other.
+              inflightTools.set(`${toolName}#${toolCallCount}`, evt);
+              event.__inflightKey = `${toolName}#${toolCallCount}`;
+            }
             console.log(`[pi:event +${elapsed}s] tool_start: ${event.toolName} #${toolCallCount}`);
             break;
 
           case "tool_execution_end":
+            {
+              const toolName = typeof event.toolName === "string" ? event.toolName : "unknown";
+              // Find the most recent in-flight entry for this tool. Without a
+              // matching key on the end event we fall back to the last-started
+              // matching tool — pi's RPC schema doesn't carry an id on the
+              // end event today.
+              let endedKey: string | undefined;
+              for (const [key, evt] of [...inflightTools.entries()].reverse()) {
+                if (evt.tool === toolName) { endedKey = key; break; }
+              }
+              if (endedKey) {
+                const evt = inflightTools.get(endedKey)!;
+                evt.endTime = Date.now();
+                inflightTools.delete(endedKey);
+              }
+            }
             console.log(`[pi:event +${elapsed}s] tool_end: ${event.toolName}`);
             break;
 
@@ -406,6 +504,7 @@ export async function runPiWorker(
           usage,
           toolCallCount,
           turnCount,
+          toolEvents,
         });
       };
       signal.addEventListener("abort", abortListener, { once: true });
@@ -419,7 +518,7 @@ export async function runPiWorker(
       console.log(`[pi:exit] code=${code}, duration=${(durationMs / 1000).toFixed(1)}s, output=${textOutput.length} chars, turns=${turnCount}, toolCalls=${toolCallCount}`);
 
       if (code === 0 || textOutput.length > 0) {
-        resolve({ success: true, output: textOutput, durationMs, usage, toolCallCount, turnCount });
+        resolve({ success: true, output: textOutput, durationMs, usage, toolCallCount, turnCount, toolEvents });
       } else {
         resolve({
           success: false,
@@ -429,6 +528,7 @@ export async function runPiWorker(
           usage,
           toolCallCount,
           turnCount,
+          toolEvents,
         });
       }
     });
@@ -444,6 +544,7 @@ export async function runPiWorker(
         output: textOutput,
         error: `spawn error: ${err.message}`,
         durationMs,
+        toolEvents,
       });
     });
 
@@ -626,17 +727,61 @@ ${params.globalPatterns}
 6. 检查测试覆盖
 7. 输出结构化 JSON 报告（**cross-repo-impact/2.0** schema，见 SKILL.md Step 5）
 
-**输出格式（严格遵守，否则结果会丢失）**：
-- 最终结果必须用 \`\`\`json ... \`\`\` 包裹
+**输出格式**：
+- 最终结果用 \`\`\`json ... \`\`\` 包裹
 - 顶层必须有 \`schema_version: "cross-repo-impact/2.0"\`、\`meta\`、\`changes\`、\`symbols\`、\`test_scenarios\`、\`unanalyzable\`
-- 所有字段名是 **snake_case**（如 \`call_tree\`、\`risk_table\`、\`downstream_contracts\`、\`diff_semantic\`、\`initial_severity\`）
-- 每个 \`symbols[]\` 必须有 \`id\`（\`SYM-001\`/\`SYM-002\`...）；\`test_scenarios[].id\` 用 \`RT-NNN\`；\`unanalyzable[].id\` 用 \`UA-NNN\`
-- \`call_tree\` 入口节点用 \`is_entry: true\` + \`entry_kind\` + \`entry_route\`（**禁止** \`[ENTRY]\` 字符串标记）
-- \`risk_table[]\` 同时填 \`priority\`（P0..P3）和 \`severity\`（high/medium/low）
-- \`downstream_contracts[]\`：\`status\` 用 \`satisfied\`/\`uncertain\`/\`violated\`；触达 sink 时 \`sink\` 填对象，否则 \`sink: null\`
-- \`test_scenarios[]\`：\`oracle\` 字典已废弃，改用 \`assertions[]\` 数组（每项一个闭合枚举 \`kind\`）；\`risk_change_ids\` 是数组、值为 \`SYM-NNN\` id；\`target_api\` 是结构化对象
-- \`unanalyzable[]\` 是结构化对象数组（带 \`id\`/\`category\`/\`subject\`/\`implication\`/\`suggested_handling\`），不是字符串列表
-- 严格按 SKILL.md Step 5 的 schema 示例输出
+- 所有字段名是 **snake_case**
+
+**完整字段约束（必填/可选/枚举值）见 [output-schema.md §5 必查清单](pi-skill/references/output-schema.md)**——
+本提示词不重复列约束，避免与文档不同步。**输出前必读 §5；每写完 3-5 个 symbol 回查一次。**
+
+### 🔴 实测最常踩的 7 条红线（输出 JSON 前再扫一遍）
+
+1. **\`downstream_contracts[]\` 字段名固定为 \`call_kind\` + \`contract_kind\`**
+   - ❌ \`kind\` / \`contract_type\` / \`transport\` 都是错的
+   - \`call_kind\` 闭合枚举：\`direct_call\` / \`http_call\` / \`mq_event\` / \`scheduler_trigger\` / \`shared_data_flow\` / \`framework_dispatch\` / \`indirect_call\`
+   - \`contract_kind\` 闭合枚举：\`param\` / \`schema\` / \`transaction\` / \`other\`
+   - **不要**写 \`{param: {status, detail}, schema: {status, detail}}\` 嵌套对象——一行只表达一种契约，多种契约写多个数组元素
+   - \`status\` 闭合枚举：\`satisfied\` / \`uncertain\` / \`violated\`（**不是** \`ok\`）
+
+2. **\`target_api.transport\` 闭合 4 枚举：\`cloud_api\` / \`vstation\` / \`internal_rpc\` / \`scheduler\`**
+   - ❌ \`HTTP\` / \`http\` / \`http_api\` / \`des_pipeline\` 都是非法值
+   - HTTP 公网 API → \`cloud_api\`；DES 流水线步骤 → \`internal_rpc\`
+
+3. **\`assertions[].kind\` 闭合 9 枚举**：
+   \`api_response\` / \`db_check\` / \`log_check\` / \`metric_check\` / \`state_check\` / \`external_call_check\` / \`mock_check\` / \`human_observation\` / \`code_fix_directive\`
+   - ❌ **禁止**生造：\`http_status\` / \`http_response\` / \`response_field\` / \`error_code\` / \`error_message\` / \`context_value\` / \`des_task\` / \`external_call\` / \`trade_goods\` / \`log_contains\`
+   - 映射建议：HTTP 返回 → \`api_response\`；DB 状态 → \`db_check\`；日志 → \`log_check\`；DES/内存上下文 → \`state_check\`；内部 RPC 是否被调 → \`external_call_check\`
+   - 每个 assertion 必填 \`kind\` / \`channel\` / \`expression\` / \`severity\`，每项**只有一个 kind**
+
+4. **\`test_scenarios[]\` 必须有 \`api_params\` 字段**（即使 \`{}\`）——下游 agent 直接消费此字段执行 API 调用
+
+5. **\`symbols[].diff_semantic\` 是字符串**（不是 \`{description, change_type, ...}\` 对象）；\`change_type\` / \`initial_severity\` 是顶层兄弟字段
+
+6. **\`call_tree[]\` 节点字段名固定为 \`function\` / \`call_type\`**（❌ 不要用 \`caller\` / \`transport\` / \`kind\` 替代）；入口节点用 \`is_entry: true\` + \`entry_kind\` + \`entry_route\`（**禁止** \`[ENTRY]\` 文本）
+
+7. **\`risk_table[]\` P0/P1 行 \`remediation\` 必填**（不能用 \`domain_context\` 兜底）；字段名用 \`function\` / \`location\`（不要用 \`caller_path\`）
+
+### 分段自检（强制）
+
+输出 \`symbols[]\` 时**采用分段产出**：
+
+- 每写完 **3-5 个 symbol** 暂停一次，自查上面 7 条红线 + [output-schema.md §5](pi-skill/references/output-schema.md) 的 26 条必查项
+- 不通过就在该批 symbol 内修，再写下一批
+- **不要**等全部 18+ 个 symbol 写完才总检——长上下文 LLM 在第 5 个 symbol 之后开始字段名漂移是已观测的失败模式（实测过 18 个 symbol 跨 3 套 schema 变体）
+
+### \`meta\` 顶层只接受 4 个 key
+
+\`tool_name\` / \`tool_version\` / \`generated_at\` / \`dimension_catalog_version\`
+
+❌ **禁止**自造 \`total_symbols\` / \`total_test_scenarios\` / \`entry_repos\` / \`summary\` / \`analysis_id\` / \`repo\` 等字段——这些信息从数组长度直接推得，meta 里写入会引入计数不一致问题。
+
+### 其它常见错
+
+- \`location\` 是 \`"file:line"\` **单字段**（不要拆成 \`file\` + \`line\` 两个字段）
+- \`name\` 字段（如填）必须与 \`symbol\` 同源；**禁止错位**写成另一个变更点的名字
+- \`unanalyzable[]\` 是结构化对象数组（带 \`id\` / \`category\` / \`subject\` / \`implication\` / \`suggested_handling\`），不是字符串列表
+- \`risk_change_ids\` 是数组、值为 \`SYM-NNN\` id（不要写函数名）
 `);
 
   return parts.join("\n");

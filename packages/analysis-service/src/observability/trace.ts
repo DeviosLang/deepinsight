@@ -18,7 +18,7 @@
 
 import * as crypto from "node:crypto";
 import type { AnalysisTask } from "@deepinsight/core";
-import type { PiWorkerResult } from "../orchestrator/piWorker.js";
+import type { PiWorkerResult, ToolEvent } from "../orchestrator/piWorker.js";
 
 const OPIK_BASE_URL = process.env.OPIK_BASE_URL ?? "http://opik-backend:8080";
 const OPIK_PROJECT = process.env.OPIK_PROJECT ?? "call_chain";
@@ -83,6 +83,16 @@ interface OpikTrace {
   output?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
   tags?: string[];
+  /**
+   * When set, Opik counts this trace toward TRACE_ERROR_RATE in the project
+   * Metrics view. Without it, the UI's success-rate chart stays flat at 100%
+   * even when our pipeline is silently timing out.
+   */
+  error_info?: {
+    exception_type: string;
+    message: string;
+    traceback?: string;
+  };
 }
 
 interface OpikSpan {
@@ -221,6 +231,37 @@ export async function flushTrace(
     const endTime = new Date().toISOString();
     const startTime = new Date(ctx.startTime).toISOString();
 
+    // Decide whether this trace counts as an error in Opik's TRACE_ERROR_RATE
+    // metric. Three failure modes feed it:
+    //   1. task.status === "failed" — pipeline gave up explicitly.
+    //   2. piResult.durationMs ≥ 895s — pi worker hit the hard timeout.
+    //   3. degradedMode (no piResult at all) — LLM circuit-breaker tripped.
+    // Only set error_info on real failures: a successful trace with this
+    // field set will show up as red in the UI, which is misleading.
+    const isTimeout = piResult ? piResult.durationMs >= 895_000 : false;
+    const isFailed = task.status === "failed";
+    const isDegraded = !piResult;
+    const errorInfo = isFailed || isTimeout || isDegraded
+      ? {
+          exception_type: isTimeout ? "PiTimeout" : isDegraded ? "DegradedMode" : "PipelineError",
+          message: task.error ?? (isTimeout ? `pi worker exceeded 895s (${(piResult?.durationMs ?? 0) / 1000}s)` : "pipeline failed"),
+        }
+      : undefined;
+
+    // Pull schemaLint summary from result._meta if present. This is set by
+    // pipeline.applySchemaLint() right after parsing pi's JSON output, and is
+    // the primary signal for "did the LLM drift from cross-repo-impact/2.0?"
+    // Aggregating in trace metadata makes drift rate visible per-task without
+    // having to grep logs.
+    const lintSummary = (() => {
+      const r = task.result as Record<string, unknown> | undefined;
+      const meta = r?._meta as Record<string, unknown> | undefined;
+      const lint = meta?.schemaLint as
+        | { warningCount?: number; categories?: Record<string, number>; driftHeavy?: boolean }
+        | undefined;
+      return lint;
+    })();
+
     // Build trace
     const trace: OpikTrace = {
       id: ctx.traceId,
@@ -249,40 +290,99 @@ export async function flushTrace(
         toolCallCount: piResult?.toolCallCount ?? 0,
         turnCount: piResult?.turnCount ?? 0,
         piOutputChars: piResult?.output.length ?? 0,
-        timedOut: piResult ? piResult.durationMs >= 895_000 : false,
+        timedOut: isTimeout,
         steerTriggered: piResult ? piResult.durationMs >= 800_000 : false,
-        degradedMode: !piResult,
+        degradedMode: isDegraded,
+        ...(lintSummary
+          ? {
+              schemaLintWarnings: lintSummary.warningCount ?? 0,
+              schemaLintCategories: lintSummary.categories ?? {},
+              schemaLintDriftHeavy: !!lintSummary.driftHeavy,
+            }
+          : {}),
       },
       tags: [
         task.status ?? "unknown",
         piResult?.toolCallCount ? `tools:${piResult.toolCallCount}` : "tools:0",
-        piResult && piResult.durationMs >= 895_000 ? "timeout" : "completed",
+        isTimeout ? "timeout" : "completed",
+        ...(lintSummary && (lintSummary.warningCount ?? 0) > 0
+          ? [`schema_drift:${lintSummary.warningCount}`]
+          : []),
+        ...(lintSummary?.driftHeavy ? ["schema_drift_heavy"] : []),
       ],
+      ...(errorInfo ? { error_info: errorInfo } : {}),
     };
 
     // Build spans
-    const spans: OpikSpan[] = ctx.spans.map((span) => ({
-      id: uuidV7(),
-      project_name: OPIK_PROJECT,
-      trace_id: ctx.traceId,
-      name: span.name,
-      type: span.name.includes("piWorker") ? "llm" as const : "general" as const,
-      start_time: new Date(span.startTime).toISOString(),
-      end_time: new Date(span.endTime).toISOString(),
-      metadata: span.metadata,
-      ...(span.name.includes("piWorker") && piResult
-        ? {
-            model: process.env.LLM_MODEL ?? "deepseek-v4-pro",
-            provider: "tokenhub",
-            usage: {
-              input: cost.inputTokens,
-              output: cost.outputTokens,
-              total: cost.inputTokens + cost.outputTokens,
-            },
-            total_estimated_cost: cost.totalCostUsd,
-          }
-        : {}),
-    }));
+    //
+    // Two-tier structure:
+    //   1. Pipeline-stage spans (getDiff, extractSymbols, prefilter, piWorker,
+    //      parseResult) — direct children of the trace.
+    //   2. Tool sub-spans — nested UNDER the piWorker span via parent_span_id,
+    //      one per pi tool_execution_start/end pair (Bash, Read, Grep,
+    //      graphify_query, etc.).
+    //
+    // We assign a stable id to the piWorker span up-front so child tool spans
+    // can reference it. Other stage spans get fresh ids inline.
+    const piWorkerSpanId = uuidV7();
+    const spans: OpikSpan[] = ctx.spans.map((span) => {
+      const isPiWorker = span.name.includes("piWorker");
+      return {
+        id: isPiWorker ? piWorkerSpanId : uuidV7(),
+        project_name: OPIK_PROJECT,
+        trace_id: ctx.traceId,
+        name: span.name,
+        type: isPiWorker ? "llm" as const : "general" as const,
+        start_time: new Date(span.startTime).toISOString(),
+        end_time: new Date(span.endTime).toISOString(),
+        metadata: span.metadata,
+        ...(isPiWorker && piResult
+          ? {
+              model: process.env.LLM_MODEL ?? "deepseek-v4-pro",
+              provider: "tokenhub",
+              usage: {
+                input: cost.inputTokens,
+                output: cost.outputTokens,
+                total: cost.inputTokens + cost.outputTokens,
+              },
+              total_estimated_cost: cost.totalCostUsd,
+            }
+          : {}),
+      };
+    });
+
+    // Tool sub-spans — one per pi tool execution. They nest under the piWorker
+    // span (parent_span_id = piWorkerSpanId) so the Opik UI shows a tree:
+    //   piWorker (430s)
+    //   ├─ tool:Bash (2.1s)        ← grep …
+    //   ├─ tool:graphify_query (1.5s)
+    //   └─ tool:Read (0.1s)
+    //
+    // Truncated executions (process killed mid-tool) get end_time = now and
+    // metadata.truncated = true so they're visually distinguishable from
+    // normal completions.
+    if (piResult?.toolEvents && piResult.toolEvents.length > 0) {
+      const fallbackEnd = new Date().toISOString();
+      for (const evt of piResult.toolEvents) {
+        const truncated = evt.endTime === undefined;
+        spans.push({
+          id: uuidV7(),
+          project_name: OPIK_PROJECT,
+          trace_id: ctx.traceId,
+          parent_span_id: piWorkerSpanId,
+          name: `tool:${evt.tool}`,
+          type: "tool",
+          start_time: new Date(evt.startTime).toISOString(),
+          end_time: truncated ? fallbackEnd : new Date(evt.endTime!).toISOString(),
+          input: evt.inputPreview ? { preview: evt.inputPreview } : undefined,
+          metadata: {
+            turn: evt.turn,
+            durationMs: truncated ? undefined : evt.endTime! - evt.startTime,
+            truncated,
+          },
+        });
+      }
+    }
 
     // Send trace first, then spans (spans reference trace_id)
     const traceOk = await postTraces([trace]);
@@ -291,7 +391,7 @@ export async function flushTrace(
     }
 
     console.log(
-      `[opik] Trace flushed: ${ctx.traceId} (task=${task.taskId}, ${(durationMs / 1000).toFixed(1)}s, $${cost.totalCostUsd.toFixed(4)}, turns=${piResult?.turnCount ?? 0}, tools=${piResult?.toolCallCount ?? 0})`,
+      `[opik] Trace flushed: ${ctx.traceId} (task=${task.taskId}, ${(durationMs / 1000).toFixed(1)}s, $${cost.totalCostUsd.toFixed(4)}, turns=${piResult?.turnCount ?? 0}, tools=${piResult?.toolCallCount ?? 0}, subSpans=${piResult?.toolEvents?.length ?? 0})`,
     );
   } catch (err) {
     // Never let tracing failure break the pipeline

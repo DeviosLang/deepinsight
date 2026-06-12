@@ -77,6 +77,19 @@ spec:
                   key: llm-base-url
             - name: LLM_MODEL
               value: "deepseek-v4-pro"
+            # Opik observability — endpoint and project are deployment-specific
+            # (内网信息), so they live in deepinsight-secrets, not in this YAML.
+            # Required keys: opik-base-url, opik-project. See secret.template.yaml.
+            - name: OPIK_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: opik-base-url
+            - name: OPIK_PROJECT
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: opik-project
             # Concurrency gate: how many analyses may run concurrently in this
             # Pod. Each analysis spawns up to 4 pi workers, so 2 concurrent
             # tasks ≈ 8 pi processes ≈ peak 4-6 GiB. Tasks beyond this stay in
@@ -84,6 +97,24 @@ spec:
             # horizontally (replicas), not by raising this number.
             - name: MAX_CONCURRENT_TASKS
               value: "2"
+            # Joint-mode dual-gate fallback (P0-B). The pipeline runs all
+            # changed repos through a single combined-diff pi call ("joint
+            # mode") when symbol counts stay below both gates; otherwise it
+            # falls back to per-repo "independent mode".
+            #
+            # JOINT_MODE_SINGLE_REPO_LIMIT — guards prompt-size blow-up from a
+            #   single oversized repo (e.g. a 128-symbol PR in cvm_api alone).
+            # JOINT_MODE_TOTAL_LIMIT — overall ceiling so 5 medium repos don't
+            #   accidentally produce a 200-symbol mega-prompt.
+            #
+            # Joint mode is ~2× faster and ~60% cheaper (the diff is read once,
+            # not N times) for "5 repos × 6 symbols" style PRs. Set both to 30
+            # via env to revert to the old single-gate behaviour without
+            # redeploying.
+            - name: JOINT_MODE_SINGLE_REPO_LIMIT
+              value: "30"
+            - name: JOINT_MODE_TOTAL_LIMIT
+              value: "80"
           resources:
             requests:
               cpu: "500m"
