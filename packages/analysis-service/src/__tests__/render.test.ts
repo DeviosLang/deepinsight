@@ -378,7 +378,7 @@ describe("renderMarkdown (cross-repo-impact/2.0)", () => {
     // Symbols section with id + new fields
     expect(md).toContain("## 📍 Symbols (1)");
     expect(md).toContain("`SYM-001`");
-    expect(md).toContain("[ENTRY* http_api: POST /?Action=CreateReservedPacks]");
+    expect(md).toContain("[ENTRY* http_api: CreateReservedPacks]");
 
     // Unanalyzable (structured table, not bullet list)
     expect(md).toContain("## ⚠️ 无法静态追踪 (1)");
@@ -480,8 +480,9 @@ describe("renderMarkdown (cross-repo-impact/2.0)", () => {
         unanalyzable: [],
       },
     });
-    // No * (not primary), kind + route shown
-    expect(md).toContain("[ENTRY http_api: POST /?Action=Foo]");
+    // No * (not primary), kind + simplified route shown (POST /?Action= prefix
+    // stripped by simplifyRoute — the transport already implies the method).
+    expect(md).toContain("[ENTRY http_api: Foo]");
   });
 
   test("structured unanalyzable[] renders as a table", () => {

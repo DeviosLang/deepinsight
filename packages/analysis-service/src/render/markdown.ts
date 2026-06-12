@@ -141,6 +141,9 @@ export function renderMarkdown(
 
   sections.push(renderSymbols(result, opts));
 
+  const mermaid = renderCallChainMermaid(result);
+  if (mermaid) sections.push(mermaid);
+
   const unanalyzable = renderUnanalyzable(result);
   if (unanalyzable) sections.push(unanalyzable);
 
@@ -676,6 +679,169 @@ function renderUnanalyzable(result: Unknown): string {
   lines.push("");
   for (const item of legacy) lines.push(`- ${String(item)}`);
   return lines.join("\n");
+}
+
+// ─── Call chain Mermaid diagram ──────────────────────────────────────────────
+
+/**
+ * Builds a Mermaid `graph TD` diagram from all symbols' callTree nodes.
+ *
+ * Each node in the tree carries:
+ *   depth    — 1 = direct caller, 2 = indirect caller, …
+ *   repo     — repository name
+ *   file     — file path (relative to repo root)
+ *   line     — line number
+ *   function — function / method name
+ *   risk     — P0 / P1 / P2 / P3 / high / medium / low / …
+ *
+ * The changed symbols (depth=0, synthesised from the symbol name itself) are
+ * rendered in orange; callers inherit colour by risk level.
+ *
+ * Layout strategy:
+ *   - One root node per changed symbol (:::changed).
+ *   - callTree nodes at depth 1 connect directly to the root.
+ *   - callTree nodes at depth > 1 connect to the closest ancestor whose
+ *     depth is exactly (their depth - 1). We use the insertion-ordered index
+ *     within the flattened list as the parent heuristic — this mirrors how
+ *     the LLM builds the tree (parent always appears before child).
+ *   - If the total node count would exceed MAX_NODES we keep only the
+ *     2-hop neighbourhood (depth ≤ 2) and append a truncation notice.
+ */
+const MAX_NODES = 30;
+
+function renderCallChainMermaid(result: Unknown): string {
+  const symbols = asArray<Unknown>(result.symbols);
+  if (symbols.length === 0) return "";
+
+  // Collect all callTree nodes across all symbols, tagged with their root symbol.
+  interface FlatNode {
+    symbolName: string;
+    depth: number;
+    repo: string;
+    file: string;
+    line: string | number;
+    fn: string;
+    risk: string;
+    /** Mermaid-safe node id */
+    id: string;
+    /** id of the parent node in the diagram */
+    parentId: string;
+  }
+
+  const allNodes: FlatNode[] = [];
+  // Map from symbol name → Mermaid root node id
+  const rootIds = new Map<string, string>();
+
+  for (const sym of symbols) {
+    const symName = String(sym.name ?? "symbol");
+    const rootId = safeMermaidId(`root_${symName}`);
+    rootIds.set(symName, rootId);
+
+    // New schema uses snake_case `call_tree`; legacy uses `callTree`.
+    const callTree = arr<Unknown>(sym, "call_tree", "callTree");
+
+    // Track the last-seen node id at each depth so we can wire up parents.
+    const depthStack = new Map<number, string>();
+    depthStack.set(0, rootId);
+
+    for (let i = 0; i < callTree.length; i++) {
+      const node = callTree[i] as Unknown;
+      const depth = Math.max(1, Number(node.depth ?? 1));
+      const repo = String(node.repo ?? "");
+      const file = String(node.file ?? "");
+      const line = node.line ?? "";
+      const fn = String(node.function ?? `node_${i}`);
+      // v2 splits legacy `risk` into `priority` (urgency) on call-tree nodes;
+      // colour by whichever is present.
+      const risk = String(pick(node, "priority", "risk") ?? "");
+
+      const id = safeMermaidId(`n_${symName}_${i}_${fn}`);
+      // Parent = closest ancestor at depth-1; fall back to root if not found.
+      const parentId = depthStack.get(depth - 1) ?? rootId;
+
+      allNodes.push({ symbolName: symName, depth, repo, file, line: String(line), fn, risk, id, parentId });
+      depthStack.set(depth, id);
+    }
+  }
+
+  if (allNodes.length === 0) return "";
+
+  // Truncate to 2-hop if too many nodes.
+  let truncated = false;
+  let nodes = allNodes;
+  if (allNodes.length > MAX_NODES) {
+    nodes = allNodes.filter((n) => n.depth <= 2);
+    truncated = true;
+  }
+
+  // Build Mermaid lines.
+  const lines: string[] = [];
+  lines.push("## 🔗 调用链影响图");
+  lines.push("");
+  if (truncated) {
+    lines.push(`> ⚠️ 节点数超过 ${MAX_NODES}，已截断为 2-hop 邻域。`);
+    lines.push("");
+  }
+  lines.push("```mermaid");
+  lines.push("graph TD");
+
+  // Declare root (changed symbol) nodes.
+  for (const sym of symbols) {
+    const symName = String(sym.name ?? "symbol");
+    const rootId = rootIds.get(symName)!;
+    const location = String(sym.location ?? "");
+    const label = location ? `${symName}<br/><small>${escapeQuote(location)}</small>` : symName;
+    lines.push(`  ${rootId}["${label}"]:::changed`);
+  }
+
+  // Declare caller nodes and edges.
+  const declaredIds = new Set<string>();
+  for (const n of nodes) {
+    if (!declaredIds.has(n.id)) {
+      const loc = n.file ? `${n.repo}/${n.file}:${n.line}` : n.repo;
+      const label = `${n.fn}<br/><small>${escapeQuote(loc)}</small>`;
+      const cls = riskClass(n.risk);
+      lines.push(`  ${n.id}["${label}"]${cls ? `:::${cls}` : ""}`);
+      declaredIds.add(n.id);
+    }
+    lines.push(`  ${n.parentId} --> ${n.id}`);
+  }
+
+  // Class definitions.
+  lines.push("  classDef changed fill:#f96,stroke:#c33,color:#fff,font-weight:bold");
+  lines.push("  classDef riskP0 fill:#fdd,stroke:#c33");
+  lines.push("  classDef riskP1 fill:#ffe0cc,stroke:#e07020");
+  lines.push("  classDef riskP2 fill:#fffbe6,stroke:#ccaa00");
+  lines.push("  classDef riskP3 fill:#e6f4ea,stroke:#2d7a4f");
+
+  lines.push("```");
+  lines.push("");
+  lines.push("_橙色节点为本次改动的函数；箭头方向为调用方 → 被调用方。_");
+
+  return lines.join("\n");
+}
+
+/** Convert a risk string to a Mermaid class name, or empty string if none. */
+function riskClass(risk: string): string {
+  const r = risk.toLowerCase();
+  if (r === "p0" || r === "critical" || r === "high") return "riskP0";
+  if (r === "p1") return "riskP1";
+  if (r === "p2" || r === "medium") return "riskP2";
+  if (r === "p3" || r === "low") return "riskP3";
+  return "";
+}
+
+/**
+ * Sanitise an arbitrary string into a valid Mermaid node id.
+ * Mermaid ids must match /[A-Za-z0-9_]+/.
+ */
+function safeMermaidId(s: string): string {
+  return s.replace(/[^A-Za-z0-9_]/g, "_").replace(/^_+/, "").slice(0, 60) || "node";
+}
+
+/** Escape double-quotes inside a Mermaid label string. */
+function escapeQuote(s: string): string {
+  return s.replace(/"/g, "&quot;");
 }
 
 // ─── Global patterns ─────────────────────────────────────────────────────────
