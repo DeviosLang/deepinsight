@@ -10,10 +10,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import YAML from "yaml";
-import type { AnalysisTask, AnalysisResult, ChangeSpec, RiskLevel } from "@deepinsight/core";
+import type { AnalysisTask, AnalysisResult, ChangeSpec, RiskLevel, CrossRepoImpactArtifact } from "@deepinsight/core";
 import { RepoManager } from "../repo/repoManager.js";
 import { coarseFilter, fineFilter } from "../pre-filter/index.js";
 import { runPiWorker, runPiWorkerWithRetry, buildAnalysisPrompt, extractJsonFromOutput } from "./piWorker.js";
+import { prefetchKnowledgeBases } from "./kbPrefetch.js";
 import type { PiWorkerConfig } from "./piWorker.js";
 import type { Symbol } from "../pre-filter/index.js";
 import {
@@ -275,10 +276,19 @@ export async function runAnalysisPipeline(
       continue;
     }
 
+    // Attach commit messages to the diff so pi knows WHY the change was made,
+    // not just WHAT changed. This significantly improves risk assessment accuracy.
+    const base = change.base ?? "HEAD~1";
+    const head = change.commit ?? "HEAD";
+    const commitMessages = repoManager.getCommitMessages(change.repo, base, head);
+    const diffWithContext = commitMessages
+      ? `=== Commit Log ===\n${commitMessages}\n\n=== Code Diff ===\n${diff}`
+      : diff;
+
     // Extract symbols
     const symbols = extractSymbolsFromDiff(diff);
     console.log(`[pipeline:${task.taskId}] ${change.repo}: diff ${diff.length} chars, ${symbols.length} symbols: ${symbols.map(s => s.name).join(', ')}`);
-    resolvedChanges.push({ change, diff, symbols });
+    resolvedChanges.push({ change, diff: diffWithContext, symbols });
   }
 
   if (resolvedChanges.length === 0) {
@@ -317,14 +327,19 @@ export async function runAnalysisPipeline(
   const changedRepos = new Set(resolvedChanges.map((rc) => rc.change.repo));
   const targetRepos = allRepos.filter((r) => !changedRepos.has(r));
 
+  const quickMode = task.options?.quickMode === true;
+
   // Coarse filter with combined symbols
   console.log(`[pipeline:${task.taskId}] Step 3: Joint coarse filter, ${allSymbols.length} symbols across ${targetRepos.length} repos...`);
   const coarseHits = await coarseFilter(allSymbols, targetRepos, repoManager);
   console.log(`[pipeline:${task.taskId}] Step 3 coarse done: ${coarseHits.size} repos hit`);
 
-  // Fine filter
+  // Fine filter — quickMode skips it entirely
   let refinedHits: Set<string>;
-  if (coarseHits.size > 3) {
+  if (quickMode) {
+    refinedHits = coarseHits;
+    console.log(`[pipeline:${task.taskId}] Step 3: Skipping joint fine filter (quickMode)`);
+  } else if (coarseHits.size > 3) {
     console.log(`[pipeline:${task.taskId}] Step 3: Joint fine filter (ast-grep) on ${coarseHits.size} repos...`);
     try {
       refinedHits = await fineFilter(allSymbols, coarseHits, task.taskId, repoManager);
@@ -336,14 +351,18 @@ export async function runAnalysisPipeline(
     refinedHits = coarseHits;
   }
 
-  // Add entry points
-  const entryPoints = (config.entryPointRepos ?? []).filter(
-    (r) => !changedRepos.has(r) && repoManager.repoExists(r),
-  );
+  // Add entry points — quickMode skips this expansion
+  const entryPoints = quickMode
+    ? []
+    : (config.entryPointRepos ?? []).filter(
+        (r) => !changedRepos.has(r) && repoManager.repoExists(r),
+      );
   // Add sink repos (downstream-chain convergence anchors)
-  const sinkRepos = (config.sinkRepos ?? []).filter(
-    (r) => !changedRepos.has(r) && repoManager.repoExists(r),
-  );
+  const sinkRepos = quickMode
+    ? []
+    : (config.sinkRepos ?? []).filter(
+        (r) => !changedRepos.has(r) && repoManager.repoExists(r),
+      );
   const finalTargetRepos = new Set([...refinedHits, ...entryPoints, ...sinkRepos]);
 
   recordSpan(traceCtx, "step3_prefilter", step3Start, {
@@ -390,13 +409,29 @@ export async function runAnalysisPipeline(
     return null;
   }
 
+  // Step 3.7: Pre-flight knowledge base lookup.
+  // Proactively query KBs whose keywords match the diff — results are injected
+  // into the prompt so pi has background context from the very first turn.
+  // Runs in parallel with nothing (pure I/O), never blocks pi spawn (60s cap).
+  // quickMode: skip KB prefetch — saves up to 60s of wall-clock.
+  const kbPrefetchResults = quickMode
+    ? []
+    : await prefetchKnowledgeBases(
+        combinedDiff,
+        config.knowledgeBases,
+        task.taskId,
+      );
+  if (kbPrefetchResults.length > 0) {
+    console.log(`[pipeline:${task.taskId}] Step 3.7: KB prefetch done — ${kbPrefetchResults.map(r => r.name).join(", ")}`);
+  }
+
   const piConfig: PiWorkerConfig & { fallbackModel?: string } = {
     provider: "tokenhub",
     model: config.llm.model,
     apiKey: config.llm.apiKey,
     baseUrl: config.llm.baseUrl,
     cwd: config.workspaceDir,
-    timeoutMs: 900_000,
+    timeoutMs: quickMode ? 480_000 : 900_000,
     thinkingLevel: "medium",
     skillPath: config.skillPath,
     fallbackModel: config.llm.fallbackModel,
@@ -410,15 +445,17 @@ export async function runAnalysisPipeline(
     sinkRepos,
     agentsMd,
     globalPatterns,
-    knowledgeBases: config.knowledgeBases,
+    knowledgeBases: quickMode ? undefined : config.knowledgeBases,
+    kbPrefetchResults,
   };
 
   const step4Start = Date.now();
-  // Limit parallel workers to avoid OOM: 4 for normal, 2 for large symbol sets
-  const MAX_PARALLEL_WORKERS = allSymbols.length > 30 ? 2 : 4;
+  // Limit parallel workers to avoid OOM: 4 for normal, 2 for large symbol sets.
+  // quickMode: force single worker — see runSingleChange for rationale.
+  const MAX_PARALLEL_WORKERS = quickMode ? 1 : (allSymbols.length > 30 ? 2 : 4);
   let piResult: Awaited<ReturnType<typeof runPiWorkerWithRetry>>;
 
-  if (allSymbols.length >= 3) {
+  if (!quickMode && allSymbols.length >= 3) {
     const groups = splitSymbolsIntoGroups(allSymbols, MAX_PARALLEL_WORKERS);
     console.log(`[pipeline:${task.taskId}] Step 4: Joint parallel — ${allSymbols.length} symbols → ${groups.length} workers (all see full diff)`);
     const workerPromises = groups.map((group, i) => {
@@ -460,22 +497,20 @@ export async function runAnalysisPipeline(
     return jsonResult as unknown as AnalysisResult;
   }
 
-  // Fallback
+  // Fallback — emit a minimal cross-repo-impact/2.0 skeleton so downstream
+  // consumers don't crash on missing schema_version. The renderer treats
+  // _rawOutput as the partial-output banner.
   flushTrace(traceCtx, task, undefined).catch(() => {});
-  return {
-    summary: {
-      totalSymbolsChanged: allSymbols.length,
-      affectedRepos: refinedHits.size,
-      unaffectedRepos: targetRepos.length - refinedHits.size,
-      riskBreakdown: { P0: 0, P1: 0, P2: 0, P3: 0, NEEDS_HUMAN_REVIEW: 0 },
-    },
+  return buildFallbackArtifact({
+    changes: resolvedChanges.map((rc) => rc.change),
     symbols: allSymbols.map((s) => ({
-      name: s.name, location: "", diffSemantic: "见原始输出", initialRisk: "medium" as const, callTree: [], riskTable: [],
+      name: s.name,
+      location: "",
+      diff_semantic: "见原始输出",
+      initial_severity: "medium" as const,
     })),
-    untrackable: [],
-    globalPatternsMatched: [],
-    _rawOutput: truncateRawOutput(piOutput),
-  } as unknown as AnalysisResult;
+    rawOutput: piOutput,
+  }) as unknown as AnalysisResult;
 }
 
 /**
@@ -557,10 +592,16 @@ async function runSingleChange(
   const coarseHits = await coarseFilter(symbols, targetRepos, repoManager);
   console.log(`[pipeline:${task.taskId}] Step 3 coarse done: ${coarseHits.size} repos hit: ${[...coarseHits].join(', ')}`);
 
+  const quickMode = task.options?.quickMode === true;
+
   // Phase 2: Fine filter — ast-grep on worktrees (only if conditions met)
   // Skip fine filter if: coarse hits ≤ 3 (not worth it) OR symbols > 20 (too many → OOM risk)
+  // quickMode: always skip — saves 30-60s of worktree checkout + ast-grep time
   let refinedHits: Set<string>;
-  if (coarseHits.size > 3 && symbols.length <= 20) {
+  if (quickMode) {
+    refinedHits = coarseHits;
+    console.log(`[pipeline:${task.taskId}] Step 3: Skipping fine filter (quickMode)`);
+  } else if (coarseHits.size > 3 && symbols.length <= 20) {
     task.progress = { step: 3, stepName: "ast-grep 精筛", reposScanned: coarseHits.size, reposTotal: targetRepos.length };
     console.log(`[pipeline:${task.taskId}] Step 3: Running fine filter (ast-grep) on ${coarseHits.size} repos...`);
     try {
@@ -585,13 +626,19 @@ async function runSingleChange(
   };
 
   // ─── Step 3.5: Merge entry point repos (always analyzed) ─────────────────────
-  const entryPoints = (config.entryPointRepos ?? []).filter(
-    (r) => r !== change.repo && repoManager.repoExists(r),
-  );
+  // quickMode: skip entry/sink expansion — keep only repos that grep actually
+  // hit. Trades cross-cutting coverage for ~1 fewer pi-worker turn.
+  const entryPoints = quickMode
+    ? []
+    : (config.entryPointRepos ?? []).filter(
+        (r) => r !== change.repo && repoManager.repoExists(r),
+      );
   // Sink repos — downstream-chain convergence anchors
-  const sinkRepos = (config.sinkRepos ?? []).filter(
-    (r) => r !== change.repo && repoManager.repoExists(r),
-  );
+  const sinkRepos = quickMode
+    ? []
+    : (config.sinkRepos ?? []).filter(
+        (r) => r !== change.repo && repoManager.repoExists(r),
+      );
   const finalTargetRepos = new Set([...refinedHits, ...entryPoints, ...sinkRepos]);
   if (entryPoints.length > 0 || sinkRepos.length > 0) {
     console.log(`[pipeline:${task.taskId}] Step 3.5: Added entry points: ${entryPoints.join(', ') || '-'}, sinks: ${sinkRepos.join(', ') || '-'} → total ${finalTargetRepos.size} repos`);
@@ -668,7 +715,11 @@ async function runSingleChange(
       apiKey: config.llm.apiKey,
       baseUrl: config.llm.baseUrl,
       cwd: config.workspaceDir,
-      timeoutMs: 900_000,
+      // quickMode: tighter timeout encourages pi to wrap up sooner. Steer
+      // fires at ~85% of timeout (≈ 408s for 480s), leaving the remaining
+      // 72s to write out the final JSON report. Empirically, 300s was too
+      // tight — pi finished tool calls but got cut off mid-report.
+      timeoutMs: quickMode ? 480_000 : 900_000,
       thinkingLevel: "medium",
       skillPath: config.skillPath,
       fallbackModel: config.llm.fallbackModel,
@@ -682,14 +733,18 @@ async function runSingleChange(
       sinkRepos,
       agentsMd,
       globalPatterns,
-      knowledgeBases: config.knowledgeBases,
+      // quickMode: skip KB attachment so pi doesn't spend turns querying.
+      knowledgeBases: quickMode ? undefined : config.knowledgeBases,
     };
 
     const step4Start = Date.now();
-    // Limit parallel workers to avoid OOM: 4 for normal, 2 for large symbol sets
-    const MAX_PARALLEL_WORKERS = symbols.length > 30 ? 2 : 4;
+    // Limit parallel workers to avoid OOM: 4 for normal, 2 for large symbol sets.
+    // quickMode: force single worker — multi-worker mode multiplies wall-clock
+    // when LLM throughput is the bottleneck (each worker waits on the same
+    // upstream API). Single worker also halves token cost.
+    const MAX_PARALLEL_WORKERS = quickMode ? 1 : (symbols.length > 30 ? 2 : 4);
 
-    if (symbols.length >= 3) {
+    if (!quickMode && symbols.length >= 3) {
       // ─── Parallel mode: split symbols into groups, run workers concurrently ──
       const groups = splitSymbolsIntoGroups(symbols, MAX_PARALLEL_WORKERS);
       console.log(`[pipeline:${task.taskId}] Step 4: Parallel mode — ${symbols.length} symbols → ${groups.length} workers`);
@@ -778,106 +833,110 @@ async function runSingleChange(
   const isTimeout = piResult ? (!piResult.success || (piResult.durationMs ?? 0) >= 895_000) : false;
   console.log(`[pipeline:${task.taskId}] Step 5: No JSON block found in output (${piOutput.length} chars, timeout=${isTimeout}). Returning raw partial result.`);
 
-  return {
-    summary: {
-      totalSymbolsChanged: symbols.length,
-      affectedRepos: refinedHits.size,
-      unaffectedRepos: targetRepos.length - refinedHits.size,
-      riskBreakdown: { P0: 0, P1: 0, P2: 0, P3: 0, NEEDS_HUMAN_REVIEW: 0 },
-    },
+  return buildFallbackArtifact({
+    changes: [change],
     symbols: symbols.map((s) => ({
       name: s.name,
-      location: `${change.repo}`,
-      diffSemantic: "见原始输出",
-      initialRisk: "medium" as const,
-      callTree: [],
-      riskTable: [],
-      downstreamContracts: [],
+      location: change.repo,
+      diff_semantic: "见原始输出",
+      initial_severity: "medium" as const,
     })),
-    untrackable: [],
-    globalPatternsMatched: [],
-    _rawOutput: truncateRawOutput(piOutput),
-  } as unknown as AnalysisResult;
+    rawOutput: piOutput,
+  }) as unknown as AnalysisResult;
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 /**
  * Merge results from multiple changes (repos) into a single report.
+ *
+ * Schema-aware: when any input declares cross-repo-impact/2.x, the merged
+ * output uses the new schema; otherwise legacy AnalysisResult shape is
+ * preserved for back-compat.
  */
 function mergeMultiChangeResults(results: AnalysisResult[]): AnalysisResult {
-  const allSymbols: unknown[] = [];
-  const allScenarios: unknown[] = [];
-  const allUntrackable: unknown[] = [];
-  let totalP0 = 0, totalP1 = 0, totalP2 = 0, totalP3 = 0, totalHuman = 0;
-  const affectedRepoSet = new Set<string>();
-
-  for (const r of results) {
-    const result = r as unknown as Record<string, unknown>;
-    const summary = result.summary as Record<string, unknown> | undefined;
-
-    if (summary) {
-      const rb = summary.riskBreakdown as Record<string, number> | undefined;
-      if (rb) {
-        totalP0 += rb.P0 ?? 0;
-        totalP1 += rb.P1 ?? 0;
-        totalP2 += rb.P2 ?? 0;
-        totalP3 += rb.P3 ?? 0;
-        totalHuman += rb.NEEDS_HUMAN_REVIEW ?? 0;
-      }
-      if (typeof summary.affectedRepos === "number") {
-        // Can't sum — we'll recalculate from symbols
-      }
-    }
-
-    if (Array.isArray(result.symbols)) {
-      for (const sym of result.symbols as Array<Record<string, unknown>>) {
-        allSymbols.push(sym);
-        if (Array.isArray(sym.callTree)) {
-          for (const node of sym.callTree as Array<Record<string, unknown>>) {
-            if (node.repo && typeof node.repo === "string") affectedRepoSet.add(node.repo);
-          }
-        }
-        // Downstream / sink repos also count as affected
-        const downstream = sanitizeDownstreamContracts(sym.downstreamContracts, `symbol=${String(sym.name ?? "")}`);
-        for (const c of downstream) {
-          if (typeof c.repo === "string") affectedRepoSet.add(c.repo);
-        }
-      }
-    }
-
-    if (Array.isArray(result.test_scenarios)) allScenarios.push(...result.test_scenarios as unknown[]);
-    if (Array.isArray(result.untrackable)) allUntrackable.push(...result.untrackable as unknown[]);
-  }
-
-  return {
-    summary: {
-      totalSymbolsChanged: allSymbols.length,
-      affectedRepos: affectedRepoSet.size,
-      unaffectedRepos: 0,
-      riskBreakdown: { P0: totalP0, P1: totalP1, P2: totalP2, P3: totalP3, NEEDS_HUMAN_REVIEW: totalHuman },
-    },
-    symbols: allSymbols,
-    test_scenarios: allScenarios,
-    untrackable: [...new Set(allUntrackable.map(String))],
-    globalPatternsMatched: [],
-  } as unknown as AnalysisResult;
+  // Reuse mergeAnalysisJsons — it already handles the dual-schema case.
+  // The cast is safe: AnalysisResult and CrossRepoImpactArtifact are both
+  // structural subsets of `Record<string, unknown>` here.
+  const merged = mergeAnalysisJsons(results as unknown as Record<string, unknown>[]);
+  return merged as unknown as AnalysisResult;
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 const REQUIRED_RISK_KEYS: ReadonlyArray<RiskLevel> = ["P0", "P1", "P2", "P3", "NEEDS_HUMAN_REVIEW"];
+const NEW_SCHEMA_VERSION_PATTERN = /^cross-repo-impact\/2\.\d+$/;
+
+/** Read a symbol's call_tree, falling back to legacy callTree. */
+function getCallTree(sym: Record<string, unknown>): unknown[] {
+  if (Array.isArray(sym.call_tree)) return sym.call_tree as unknown[];
+  if (Array.isArray(sym.callTree)) return sym.callTree as unknown[];
+  return [];
+}
+
+/** Read a symbol's risk_table, falling back to legacy riskTable. */
+function getRiskTable(sym: Record<string, unknown>): unknown[] {
+  if (Array.isArray(sym.risk_table)) return sym.risk_table as unknown[];
+  if (Array.isArray(sym.riskTable)) return sym.riskTable as unknown[];
+  return [];
+}
+
+/** Read a symbol's downstream_contracts, falling back to legacy downstreamContracts. */
+function getDownstreamContracts(sym: Record<string, unknown>): unknown[] {
+  if (Array.isArray(sym.downstream_contracts)) return sym.downstream_contracts as unknown[];
+  if (Array.isArray(sym.downstreamContracts)) return sym.downstreamContracts as unknown[];
+  return [];
+}
+
+/** Read a symbol's diff_semantic, falling back to legacy diffSemantic. */
+function getDiffSemantic(sym: Record<string, unknown>): string {
+  if (typeof sym.diff_semantic === "string") return sym.diff_semantic;
+  if (typeof sym.diffSemantic === "string") return sym.diffSemantic;
+  return "";
+}
 
 /**
- * Validate that an arbitrary parsed-JSON object conforms to AnalysisResult's
- * required shape. Tolerant of extra fields (forward-compat) but strict on
- * the fields downstream consumers will dereference.
+ * Extract repos a downstream contract reaches. New schema uses `sink.repo`;
+ * legacy uses bare `repo` (which is also still allowed in new schema for the
+ * callee location).
+ */
+function downstreamContractRepos(c: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  if (typeof c.repo === "string") out.push(c.repo);
+  const sink = c.sink as Record<string, unknown> | null | undefined;
+  if (sink && typeof sink === "object" && typeof sink.repo === "string") {
+    out.push(sink.repo);
+  }
+  // Legacy fallback
+  if (typeof c.sinkRepo === "string") out.push(c.sinkRepo);
+  return out;
+}
+
+/**
+ * Validate that a parsed-JSON object is a usable analysis result. Accepts
+ * EITHER the new cross-repo-impact/2.x shape OR the legacy AnalysisResult
+ * shape (so existing fixtures and any pi worker still emitting old format
+ * keep working during the migration window).
+ *
+ * Tolerant of extra fields (forward-compat) but strict on the fields
+ * downstream consumers will dereference.
  */
 function isValidAnalysisResult(obj: unknown): boolean {
   if (typeof obj !== "object" || obj === null) return false;
   const o = obj as Record<string, unknown>;
 
-  // summary.{totalSymbolsChanged, affectedRepos, unaffectedRepos, riskBreakdown}
+  // New schema path: schema_version present + symbols array
+  if (typeof o.schema_version === "string" && NEW_SCHEMA_VERSION_PATTERN.test(o.schema_version)) {
+    if (!Array.isArray(o.symbols)) return false;
+    // unanalyzable: required array; tolerant of legacy untrackable
+    const una = o.unanalyzable;
+    if (una !== undefined && !Array.isArray(una)) return false;
+    // test_scenarios: required array (may be empty); tolerant if missing
+    if (o.test_scenarios !== undefined && !Array.isArray(o.test_scenarios)) return false;
+    return true;
+  }
+
+  // Legacy schema path: full summary object required
   const summary = o.summary;
   if (typeof summary !== "object" || summary === null) return false;
   const s = summary as Record<string, unknown>;
@@ -890,10 +949,7 @@ function isValidAnalysisResult(obj: unknown): boolean {
     if (typeof rb[key] !== "number") return false;
   }
 
-  // symbols must be an array (entries can be loose; downstream tolerates)
   if (!Array.isArray(o.symbols)) return false;
-
-  // untrackable + globalPatternsMatched: arrays if present
   if (o.untrackable !== undefined && !Array.isArray(o.untrackable)) return false;
   if (o.globalPatternsMatched !== undefined && !Array.isArray(o.globalPatternsMatched)) return false;
 
@@ -904,7 +960,18 @@ function isValidAnalysisResult(obj: unknown): boolean {
 function describeValidationFailure(obj: unknown): string {
   if (typeof obj !== "object" || obj === null) return "not an object";
   const o = obj as Record<string, unknown>;
-  if (typeof o.summary !== "object" || o.summary === null) return "missing summary";
+
+  // If they tried new schema, point at version-specific issues
+  if (typeof o.schema_version === "string") {
+    if (!NEW_SCHEMA_VERSION_PATTERN.test(o.schema_version)) {
+      return `unsupported schema_version: ${o.schema_version}`;
+    }
+    if (!Array.isArray(o.symbols)) return "symbols is not an array";
+    return "unknown new-schema validation error";
+  }
+
+  // Legacy diagnostic
+  if (typeof o.summary !== "object" || o.summary === null) return "missing summary (and no schema_version)";
   const s = o.summary as Record<string, unknown>;
   if (typeof s.riskBreakdown !== "object" || s.riskBreakdown === null) return "missing summary.riskBreakdown";
   const rb = s.riskBreakdown as Record<string, unknown>;
@@ -915,31 +982,40 @@ function describeValidationFailure(obj: unknown): string {
 }
 
 /**
- * Sanitize the `downstreamContracts` field of a symbol coming from LLM JSON.
+ * Sanitize the `downstream_contracts` (or legacy `downstreamContracts`) field
+ * of a symbol coming from LLM JSON.
  *
  * EP-005 (cross-boundary data not validated): this field originates from an
  * untrusted model output. We never dereference it raw. Non-array input or
  * malformed elements are dropped with a warning rather than crashing the
  * merge or silently producing `undefined` downstream.
  *
+ * Accepts both the new schema (callee + optional repo + sink object) and the
+ * legacy schema (callee + repo + reachesSink + sinkRepo). The minimum
+ * requirement is `callee: string` — `repo` is optional in the new schema
+ * because the callee may be a leaf without a tracked sink.
+ *
  * @returns a clean array of contract-shaped records (may be empty)
  */
 function sanitizeDownstreamContracts(raw: unknown, ctx: string): Array<Record<string, unknown>> {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) {
-    console.warn(`[merge] downstreamContracts not an array (${ctx}) — dropping`);
+    console.warn(`[merge] downstream_contracts not an array (${ctx}) — dropping`);
     return [];
   }
   const out: Array<Record<string, unknown>> = [];
   for (const item of raw) {
     if (typeof item !== "object" || item === null) {
-      console.warn(`[merge] downstreamContracts element not an object (${ctx}) — skipping`);
+      console.warn(`[merge] downstream_contracts element not an object (${ctx}) — skipping`);
       continue;
     }
     const c = item as Record<string, unknown>;
-    // Require the two fields merge logic dereferences: callee (dedup key) + repo (affectedRepos).
-    if (typeof c.callee !== "string" || typeof c.repo !== "string") {
-      console.warn(`[merge] downstreamContracts element missing callee/repo (${ctx}) — skipping`);
+    // Require only the field we MUST have to dedup: callee. repo is optional in
+    // the new schema (sink-less leaves don't need a repo on the contract row;
+    // their repo, when present, lives in sink.repo). Legacy entries that DID
+    // carry a flat `repo` still pass through.
+    if (typeof c.callee !== "string") {
+      console.warn(`[merge] downstream_contracts element missing callee (${ctx}) — skipping`);
       continue;
     }
     out.push(c);
@@ -955,6 +1031,47 @@ function truncateRawOutput(output: string): string {
   const MAX_RAW_LENGTH = 4096;
   if (output.length <= MAX_RAW_LENGTH) return output;
   return "...(truncated)...\n" + output.slice(-MAX_RAW_LENGTH);
+}
+
+/**
+ * Build a minimal cross-repo-impact/2.0 fallback artifact when pi fails to
+ * emit valid JSON. Contains stub symbols (no call_tree / risk_table) plus a
+ * `_rawOutput` tail so the renderer can show the partial pi text.
+ */
+function buildFallbackArtifact(params: {
+  changes: ChangeSpec[];
+  symbols: Array<{ name: string; location: string; diff_semantic: string; initial_severity: "high" | "medium" | "low" }>;
+  rawOutput: string;
+}): Record<string, unknown> {
+  return {
+    schema_version: "cross-repo-impact/2.0",
+    meta: {
+      tool_name: "deepinsight-pipeline",
+      tool_version: "2.0",
+      generated_at: new Date().toISOString(),
+      dimension_catalog_version: "tapd-requirement-analyzer/4.A-2/v1",
+    },
+    changes: params.changes.map((c) => ({
+      repo: c.repo,
+      branch: c.branch,
+      head_commit: c.commit ?? "",
+      base_commit: c.base,
+    })),
+    symbols: params.symbols.map((s, i) => ({
+      id: `SYM-${String(i + 1).padStart(3, "0")}`,
+      name: s.name,
+      location: s.location,
+      diff_semantic: s.diff_semantic,
+      initial_severity: s.initial_severity,
+      call_tree: [],
+      risk_table: [],
+      downstream_contracts: [],
+    })),
+    test_scenarios: [],
+    unanalyzable: [],
+    global_patterns_matched: [],
+    _rawOutput: truncateRawOutput(params.rawOutput),
+  };
 }
 
 /**
@@ -1220,12 +1337,14 @@ function mergeParallelPiResults(
 /**
  * Compute a stable dedup key for a symbol entry produced by an LLM worker.
  *
- * History: workers occasionally label the same function differently
- * (e.g. "check_rate_limit" vs "check_rate_limit (rate_limiter.py v2.0)"),
- * so keying solely on `name` left the merge step blind to duplicates that
- * pointed at the same source location. We now key primarily on the
- * location (file basename + line), with name as a fallback when the
- * location is missing or unparseable.
+ * Order of preference:
+ *   1. `id` (SYM-NNN) — new schema, stable across re-runs by contract.
+ *      When workers all emit ids we never need anything else.
+ *   2. `<basename>:<line>` from `location` — older fallback that survived the
+ *      pre-id era. Two workers labelling the same function differently
+ *      (e.g. "check_rate_limit" vs "check_rate_limit (rate_limiter.py v2.0)")
+ *      still collide here.
+ *   3. Normalized `name` — last-resort when location is missing/unparseable.
  *
  * Returns a tuple [primary, fallback] where `primary` is preferred for
  * matching and `fallback` provides backwards compatibility — so a worker
@@ -1234,7 +1353,16 @@ function mergeParallelPiResults(
  */
 function symbolDedupKey(sym: Record<string, unknown>): { primary: string; fallback: string } {
   const name = String(sym.name ?? "").trim();
+  const id = typeof sym.id === "string" ? sym.id.trim() : "";
   const location = String(sym.location ?? "").trim();
+
+  // Highest precedence: explicit id (new schema). Note we still record `name`
+  // as the fallback so a later worker that emitted name-only can resolve into
+  // the same entry. The reverse — id-only resolving to a name-keyed entry —
+  // does NOT happen because two id-bearing workers always agree on the id.
+  if (id) {
+    return { primary: id, fallback: name || location };
+  }
 
   // Try to extract `<basename>:<line>` from location.
   // Examples handled:
@@ -1266,70 +1394,107 @@ function pickBetterName(a: string, b: string): string {
 /**
  * Merge multiple analysis JSON outputs into one.
  *
- * Dedup strategy (post-2026-06): primary key is normalized location
- * (basename:line). Falls back to symbol name only when location is
- * missing/unparseable. This fixes the long-standing bug where parallel
- * workers labelling the same function differently produced duplicate
- * symbol entries.
+ * Schema-tolerant: handles both cross-repo-impact/2.x (snake_case +
+ * `id: SYM-NNN`) and the legacy AnalysisResult shape (camelCase). When the
+ * inputs are mixed (one worker on new schema, another on legacy), the merge
+ * picks whichever shape the first input declares for the output, falling
+ * back to legacy if no `schema_version` is present anywhere.
+ *
+ * Dedup strategy:
+ *   1. SYM-NNN id when available.
+ *   2. Normalized location (basename:line) — fixes parallel workers labelling
+ *      the same function differently.
+ *   3. Symbol name as last resort.
  */
 function mergeAnalysisJsons(jsons: Record<string, unknown>[]): Record<string, unknown> {
   const symbolMap = new Map<string, Record<string, unknown>>();
   const keyAliases = new Map<string, string>(); // fallback-key → primary-key
   const allScenarios: unknown[] = [];
+  // Both new (unanalyzable: object[]) and legacy (untrackable: string[]) collected
+  // separately; the chosen shape is decided at output time based on what was seen.
+  const allUnanalyzable: Record<string, unknown>[] = [];
   const allUntrackable: unknown[] = [];
+  const allGlobalPatterns: string[] = [];
   let totalP0 = 0, totalP1 = 0, totalP2 = 0, totalP3 = 0, totalHuman = 0;
   const affectedRepoSet = new Set<string>();
 
+  // Detect whether we should emit new-schema output. Any input with
+  // schema_version: cross-repo-impact/2.x flips the switch.
+  let emitNewSchema = false;
+  let firstMeta: Record<string, unknown> | undefined;
+  let firstChanges: unknown[] | undefined;
+
   for (const json of jsons) {
-    // Collect and dedup symbols by (location, name)
+    if (typeof json.schema_version === "string" && NEW_SCHEMA_VERSION_PATTERN.test(json.schema_version)) {
+      emitNewSchema = true;
+      if (!firstMeta && typeof json.meta === "object" && json.meta !== null) {
+        firstMeta = json.meta as Record<string, unknown>;
+      }
+      if (!firstChanges && Array.isArray(json.changes)) {
+        firstChanges = json.changes as unknown[];
+      }
+    }
+
+    // Collect and dedup symbols (works for both schemas via getCallTree etc.)
     if (Array.isArray(json.symbols)) {
       for (const sym of json.symbols as Array<Record<string, unknown>>) {
         const { primary, fallback } = symbolDedupKey(sym);
         if (!primary && !fallback) continue;
 
         // Resolve to canonical key:
-        //  1. If primary already in map → use it directly.
-        //  2. Else if this entry has no usable location (primary derived from
+        //  1. SYM-NNN id always wins — direct match if present in map.
+        //  2. If primary already in map → use it directly.
+        //  3. Else if this entry has no usable location (primary derived from
         //     name), look up via fallback alias to catch "same fn, different
         //     name suffix" cases. We deliberately DO NOT consult the alias map
         //     when primary is a file:line — that would over-merge two distinct
         //     locations that happen to share a name (e.g. a wrapper +
         //     wrapped fn).
-        //  3. Else this entry establishes a new primary; record fallback as
+        //  4. Else this entry establishes a new primary; record fallback as
         //     alias only when primary itself was name-derived.
-        const primaryIsLocationBased = /[:.]/.test(primary) && primary !== fallback;
+        const isIdKey = /^SYM-\d+$/i.test(primary);
+        const primaryIsLocationBased = !isIdKey && /[:.]/.test(primary) && primary !== fallback;
         let key: string;
         if (symbolMap.has(primary)) {
           key = primary;
+        } else if (isIdKey) {
+          // Establish new id-keyed entry; alias by name+location too so
+          // late-arriving id-less variants resolve into it.
+          key = primary;
+          if (fallback && fallback !== key) keyAliases.set(fallback, key);
         } else if (!primaryIsLocationBased && fallback && keyAliases.has(fallback)) {
           key = keyAliases.get(fallback)!;
         } else {
           key = primary || fallback;
-          // Record alias only for name-derived primaries — for location-based
-          // keys, the location IS the canonical identifier.
           if (!primaryIsLocationBased && fallback && fallback !== key) {
             keyAliases.set(fallback, key);
           }
         }
 
-        const callTree = Array.isArray(sym.callTree) ? sym.callTree : [];
-        const riskTable = Array.isArray(sym.riskTable) ? sym.riskTable : [];
-        // EP-005: downstreamContracts is untrusted LLM output — sanitize before use.
-        const downstream = sanitizeDownstreamContracts(sym.downstreamContracts, `symbol=${key}`);
-        sym.downstreamContracts = downstream;
+        const callTree = getCallTree(sym);
+        const riskTable = getRiskTable(sym);
+        const downstreamRaw = sym.downstream_contracts ?? sym.downstreamContracts;
+        const downstream = sanitizeDownstreamContracts(downstreamRaw, `symbol=${key}`);
+        // Normalize: write back to the canonical (new-schema) field, leaving
+        // the legacy one undefined. Renderer reads either.
+        sym.downstream_contracts = downstream;
+        if ("downstreamContracts" in sym) {
+          delete sym.downstreamContracts;
+        }
 
-        // Skip empty shells (no callTree, no riskTable, AND no downstream contracts)
+        // Skip empty shells (no callTree, no riskTable, no downstream, no diff)
         const isEmpty =
-          callTree.length === 0 && riskTable.length === 0 && downstream.length === 0 && !sym.diffSemantic;
+          callTree.length === 0 &&
+          riskTable.length === 0 &&
+          downstream.length === 0 &&
+          !getDiffSemantic(sym);
 
         if (symbolMap.has(key)) {
           // Merge: keep the version with more content
           const existing = symbolMap.get(key)!;
-          const existingCT = Array.isArray(existing.callTree) ? existing.callTree as unknown[] : [];
-          const existingRT = Array.isArray(existing.riskTable) ? existing.riskTable as unknown[] : [];
-          const existingDC = Array.isArray(existing.downstreamContracts)
-            ? existing.downstreamContracts as unknown[]
-            : [];
+          const existingCT = getCallTree(existing);
+          const existingRT = getRiskTable(existing);
+          const existingDC = getDownstreamContracts(existing);
 
           if (
             callTree.length > existingCT.length ||
@@ -1337,8 +1502,7 @@ function mergeAnalysisJsons(jsons: Record<string, unknown>[]): Record<string, un
             downstream.length > existingDC.length
           ) {
             // New version has more detail — replace, but preserve the more
-            // informative name (longer = more context, e.g. "check_rate_limit
-            // (rate_limiter.py v2.0)" beats bare "check_rate_limit").
+            // informative name (longer = more context).
             if (!isEmpty) {
               const betterName = pickBetterName(
                 String(existing.name ?? ""),
@@ -1354,47 +1518,52 @@ function mergeAnalysisJsons(jsons: Record<string, unknown>[]): Record<string, un
             );
             existing.name = betterName;
           }
-          // Merge riskTable entries (append unique ones)
+          // Merge risk_table entries (append unique ones by location)
           if (riskTable.length > 0 && existingRT.length > 0) {
             const merged = symbolMap.get(key)!;
-            const mergedRT = Array.isArray(merged.riskTable) ? [...merged.riskTable as unknown[]] : [];
-            const existingLocations = new Set(mergedRT.map((e: unknown) => (e as Record<string, unknown>).location));
+            const mergedRT = [...getRiskTable(merged)];
+            const existingLocations = new Set(
+              mergedRT.map((e: unknown) => (e as Record<string, unknown>).location),
+            );
             for (const entry of riskTable) {
               if (!existingLocations.has((entry as Record<string, unknown>).location)) {
                 mergedRT.push(entry);
               }
             }
-            merged.riskTable = mergedRT;
+            // Write back via the canonical (new) field.
+            merged.risk_table = mergedRT;
+            if ("riskTable" in merged) delete merged.riskTable;
           }
-          // Merge downstreamContracts (append unique by callee + file:line)
+          // Merge downstream_contracts (append unique by callee + file:line)
           if (downstream.length > 0 && existingDC.length > 0) {
             const merged = symbolMap.get(key)!;
-            const mergedDC = Array.isArray(merged.downstreamContracts)
-              ? [...merged.downstreamContracts as Array<Record<string, unknown>>]
-              : [];
-            const dcKey = (c: Record<string, unknown>) => `${c.callee}@${c.file}:${c.line}`;
+            const mergedDC = [...getDownstreamContracts(merged)] as Array<Record<string, unknown>>;
+            const dcKey = (c: Record<string, unknown>) => `${c.callee}@${c.file ?? ""}:${c.line ?? ""}`;
             const seenDC = new Set(mergedDC.map(dcKey));
             for (const c of downstream) {
               if (!seenDC.has(dcKey(c))) mergedDC.push(c);
             }
-            merged.downstreamContracts = mergedDC;
+            merged.downstream_contracts = mergedDC;
+            if ("downstreamContracts" in merged) delete merged.downstreamContracts;
           }
         } else {
           if (!isEmpty) symbolMap.set(key, sym);
         }
 
-        // Extract affected repos from callTree
+        // Extract affected repos from call_tree
         for (const node of callTree as Array<Record<string, unknown>>) {
           if (node.repo && typeof node.repo === "string") affectedRepoSet.add(node.repo);
         }
         // Downstream / sink repos also count as affected
         for (const c of downstream) {
-          if (typeof c.repo === "string") affectedRepoSet.add(c.repo);
+          for (const r of downstreamContractRepos(c)) affectedRepoSet.add(r);
         }
       }
     }
 
-    // Sum risk breakdown
+    // Sum risk breakdown — only present in legacy outputs; new-schema outputs
+    // don't carry a summary. We accumulate whatever we see and recompute from
+    // call_tree priorities afterwards.
     const summary = json.summary as Record<string, unknown> | undefined;
     if (summary) {
       const rb = summary.riskBreakdown as Record<string, number> | undefined;
@@ -1407,28 +1576,76 @@ function mergeAnalysisJsons(jsons: Record<string, unknown>[]): Record<string, un
       }
     }
 
-    // Collect test scenarios (dedup by scenario name)
+    // Collect test scenarios (dedup by id when present, else by scenario name)
     if (Array.isArray(json.test_scenarios)) {
       allScenarios.push(...json.test_scenarios);
     }
 
-    // Collect untrackable
+    // Collect unanalyzable (new) and untrackable (legacy)
+    if (Array.isArray(json.unanalyzable)) {
+      for (const item of json.unanalyzable as unknown[]) {
+        if (typeof item === "object" && item !== null) {
+          allUnanalyzable.push(item as Record<string, unknown>);
+        }
+      }
+    }
     if (Array.isArray(json.untrackable)) {
       allUntrackable.push(...json.untrackable);
     }
+
+    // Collect global patterns (both naming conventions)
+    const gp = json.global_patterns_matched ?? json.globalPatternsMatched;
+    if (Array.isArray(gp)) {
+      for (const p of gp) if (typeof p === "string") allGlobalPatterns.push(p);
+    }
   }
 
-  // Dedup scenarios by name
-  const scenarioNames = new Set<string>();
+  // Dedup scenarios — prefer id, fall back to scenario text.
+  const scenarioKeySeen = new Set<string>();
   const dedupedScenarios = allScenarios.filter((s) => {
-    const name = String((s as Record<string, unknown>).scenario ?? "");
-    if (scenarioNames.has(name)) return false;
-    scenarioNames.add(name);
+    const o = s as Record<string, unknown>;
+    const k = typeof o.id === "string" ? `id:${o.id}` : `name:${String(o.scenario ?? "")}`;
+    if (scenarioKeySeen.has(k)) return false;
+    scenarioKeySeen.add(k);
+    return true;
+  });
+
+  // Dedup unanalyzable by id (new) or by subject (legacy-derived).
+  const unanalyzableKeySeen = new Set<string>();
+  const dedupedUnanalyzable = allUnanalyzable.filter((u) => {
+    const k = typeof u.id === "string" ? `id:${u.id}` : `subj:${String(u.subject ?? "")}`;
+    if (unanalyzableKeySeen.has(k)) return false;
+    unanalyzableKeySeen.add(k);
     return true;
   });
 
   const dedupedSymbols = [...symbolMap.values()];
 
+  // If any input declared the new schema, emit new-schema output. Otherwise
+  // fall back to legacy (preserves test fixtures + any callsite still on
+  // pre-2.0 pipeline).
+  if (emitNewSchema) {
+    return {
+      schema_version: "cross-repo-impact/2.0",
+      meta: firstMeta ?? buildDefaultMeta(),
+      changes: firstChanges ?? [],
+      symbols: dedupedSymbols,
+      test_scenarios: dedupedScenarios,
+      unanalyzable: dedupedUnanalyzable.length > 0
+        ? dedupedUnanalyzable
+        // Promote legacy untrackable strings to schema_unknown items for compat.
+        : [...new Set(allUntrackable.map(String))].map((subject, i) => ({
+            id: `UA-${String(i + 1).padStart(3, "0")}`,
+            category: "schema_unknown",
+            subject,
+            implication: "(legacy untrackable string promoted to unanalyzable; investigate manually)",
+            suggested_handling: "manual",
+          })),
+      global_patterns_matched: [...new Set(allGlobalPatterns)],
+    };
+  }
+
+  // Legacy output (back-compat). Preserve historical summary shape.
   return {
     summary: {
       totalSymbolsChanged: dedupedSymbols.length,
@@ -1445,7 +1662,17 @@ function mergeAnalysisJsons(jsons: Record<string, unknown>[]): Record<string, un
     symbols: dedupedSymbols,
     test_scenarios: dedupedScenarios,
     untrackable: [...new Set(allUntrackable.map(String))],
-    globalPatternsMatched: [],
+    globalPatternsMatched: [...new Set(allGlobalPatterns)],
+  };
+}
+
+/** Build a default meta block when merge synthesizes new-schema output. */
+function buildDefaultMeta(): Record<string, unknown> {
+  return {
+    tool_name: "deepinsight-pipeline",
+    tool_version: "2.0",
+    generated_at: new Date().toISOString(),
+    dimension_catalog_version: "tapd-requirement-analyzer/4.A-2/v1",
   };
 }
 

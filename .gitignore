@@ -33,6 +33,9 @@ ERROR.md
 # Local Claude Code config (private to each developer)
 .claude/
 
+# Local deployment context (contains IPs, namespace, credentials — do not commit)
+CLAUDE.local.md
+
 # Internal review notes (not for public consumption)
 AGENTS_MD_INFRASTRUCTURE_ANALYSIS.md
 AGENTS_MD_QUICK_REFERENCE.md

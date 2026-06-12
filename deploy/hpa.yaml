@@ -1,0 +1,65 @@
+apiVersion: autoscaling/v2beta2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: deepinsight-server
+  namespace: rag-etl
+  labels:
+    app: deepinsight-server
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: deepinsight-server
+  # min=2 keeps the multi-Pod NFS-fallback path always exercised (single-Pod
+  # mode would mask cross-Pod state issues until they bite at scale).
+  # max=5 × MAX_CONCURRENT_TASKS=2 = 10 concurrent analyses cluster-wide,
+  # enough for the predicted load without exhausting the LLM API quota.
+  minReplicas: 2
+  maxReplicas: 5
+  metrics:
+    # CPU target — analyses are CPU-light at the Node.js layer (most time is
+    # spent in pi worker subprocesses + LLM round-trips), but `git grep` /
+    # `ast-grep` bursts during pre-filter push CPU briefly. requests=500m so
+    # 70% utilization → ~350m sustained, which is the level where a second
+    # Pod meaningfully helps.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    # Memory target — pi workers each take ~300-500Mi resident, so 2 active
+    # tasks × 4 workers ≈ 4Gi out of 16Gi limit. requests=2Gi puts 80% at
+    # 1.6Gi, which is roughly when a Pod has both slots occupied.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      # React quickly to a sustained surge — wait 60s of high utilization
+      # before adding capacity to avoid scaling on a single brief spike.
+      stabilizationWindowSeconds: 60
+      policies:
+        # Add up to 2 Pods per minute. With 2 → 4 → 5, max-out takes ~2 min.
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      # Hold at peak for 5 minutes after load drops. An analysis can take
+      # 9-15 minutes; we don't want HPA scaling down while the Pod is still
+      # finishing the last task in its queue (we'd kill the worker).
+      # Combined with `terminationGracePeriodSeconds` on the Deployment,
+      # this gives in-flight tasks room to complete before shrinkage.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

@@ -6,7 +6,13 @@ metadata:
   labels:
     app: deepinsight-server
 spec:
-  replicas: 1
+  # 2 replicas × MAX_CONCURRENT_TASKS=2 = 4 concurrent analyses cluster-wide.
+  # State is shared via NFS (`/data/workspace/.deepinsight/tasks/*.json`):
+  # - GET handlers fall back to NFS when in-memory cache misses
+  # - DELETE only works on the Pod that owns the task (returns 409 otherwise)
+  # - Pod startup uses a 60-min staleness threshold for orphan recovery so
+  #   one Pod's restart doesn't mark sibling Pods' live tasks as failed
+  replicas: 2
   selector:
     matchLabels:
       app: deepinsight-server
@@ -20,6 +26,13 @@ spec:
       labels:
         app: deepinsight-server
     spec:
+      # Give in-flight analyses up to 15 min to wrap up when this Pod is
+      # marked for termination (rolling update or HPA scale-down). The
+      # pipeline tops out around 9-15 min; killing mid-run wastes the
+      # work and surfaces "orphaned by service restart" to the caller.
+      # The Deployment's readinessProbe also stops sending new requests
+      # to a terminating Pod, so it'll drain naturally during this window.
+      terminationGracePeriodSeconds: 900
       containers:
         - name: server
           image: mirrors.tencent.com/cvm/deepinsight:latest
@@ -64,6 +77,13 @@ spec:
                   key: llm-base-url
             - name: LLM_MODEL
               value: "deepseek-v4-pro"
+            # Concurrency gate: how many analyses may run concurrently in this
+            # Pod. Each analysis spawns up to 4 pi workers, so 2 concurrent
+            # tasks ≈ 8 pi processes ≈ peak 4-6 GiB. Tasks beyond this stay in
+            # "queued" state and start when a slot frees up. Scale throughput
+            # horizontally (replicas), not by raising this number.
+            - name: MAX_CONCURRENT_TASKS
+              value: "2"
           resources:
             requests:
               cpu: "500m"

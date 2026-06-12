@@ -1,0 +1,276 @@
+# DeepInsight Deployment Recommendations
+# This file contains recommended configurations based on concurrent analysis
+# Copy sections to your actual deployment files as needed
+
+---
+# TIER 1: Immediate improvements (low risk, no testing required)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepinsight-server-recommended
+  namespace: rag-etl
+  labels:
+    app: deepinsight-server
+spec:
+  # Increase replicas for better availability and load distribution
+  replicas: 3  # UP FROM 1 - for production environments
+  
+  selector:
+    matchLabels:
+      app: deepinsight-server
+  
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  
+  template:
+    metadata:
+      labels:
+        app: deepinsight-server
+    spec:
+      # Pod disruption budget ensures min 2 pods always available
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - deepinsight-server
+                topologyKey: kubernetes.io/hostname
+      
+      containers:
+        - name: server
+          image: mirrors.tencent.com/cvm/deepinsight:latest
+          imagePullPolicy: Always
+          command: ["node", "packages/analysis-service/dist/index.js"]
+          
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          
+          env:
+            # Original env vars
+            - name: TZ
+              value: Asia/Shanghai
+            - name: PORT
+              value: "8080"
+            - name: NODE_ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "info"
+            - name: WORKSPACE_DIR
+              value: "/data/workspace"
+            - name: SCRATCH_DIR
+              value: "/data/scratch"
+            - name: PROJECT_CONFIG_PATH
+              value: "/etc/deepinsight/project.yml"
+            
+            # TIER 1: Debug and memory tuning
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=8192"  # Increase Node.js heap
+            
+            # TIER 2: Concurrency control parameters (expose for dynamic tuning)
+            # Uncomment to enable and adjust based on your environment
+            # - name: COARSE_FILTER_CONCURRENCY
+            #   value: "10"                       # git grep parallel degree
+            # - name: MAX_PARALLEL_WORKERS
+            #   value: "4"                        # pi workers parallel count
+            # - name: MAX_TARGET_REPOS
+            #   value: "10"                       # max repos to analyze
+            # - name: PI_WORKER_TIMEOUT_MS
+            #   value: "600000"                   # 10 min timeout in milliseconds
+            # - name: MAX_CONCURRENT_TASKS
+            #   value: "200"                      # max tasks in memory
+            
+            # LLM credentials (unchanged)
+            - name: LLM_ANALYSIS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: llm-api-key
+            - name: TOKENHUB_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: llm-api-key
+            - name: LLM_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: deepinsight-secrets
+                  key: llm-base-url
+            - name: LLM_MODEL
+              value: "deepseek-v4-pro"
+          
+          # TIER 1: Improved resource configuration
+          resources:
+            requests:
+              cpu: "1"           # UP FROM 500m for better scheduling
+              memory: "4Gi"      # UP FROM 2Gi for typical workloads
+            limits:
+              cpu: "6"           # UP FROM 4 for burst capacity
+              memory: "24Gi"     # UP FROM 16Gi for large analyses
+          
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 5
+          
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/workspace
+            - name: scratch
+              mountPath: /data/scratch
+            - name: config
+              mountPath: /etc/deepinsight
+              readOnly: true
+      
+      imagePullSecrets:
+        - name: memorix-base
+      
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: shirakami-workspace-nfs
+        - name: scratch
+          emptyDir:
+            sizeLimit: 20Gi
+        - name: config
+          configMap:
+            name: deepinsight-config
+
+---
+# Pod Disruption Budget for High Availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: deepinsight-pdb
+  namespace: rag-etl
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: deepinsight-server
+
+---
+# Horizontal Pod Autoscaler (TIER 2: Optional)
+# Uncomment to enable auto-scaling based on CPU/memory
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: deepinsight-hpa
+#   namespace: rag-etl
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: deepinsight-server
+#   minReplicas: 2
+#   maxReplicas: 5
+#   metrics:
+#     - type: Resource
+#       resource:
+#         name: cpu
+#         target:
+#           type: Utilization
+#           averageUtilization: 70
+#     - type: Resource
+#       resource:
+#         name: memory
+#         target:
+#           type: Utilization
+#           averageUtilization: 80
+
+---
+# NetworkPolicy for resource isolation (TIER 2: Optional)
+# Uncomment to enforce network segmentation
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: deepinsight-network-policy
+#   namespace: rag-etl
+# spec:
+#   podSelector:
+#     matchLabels:
+#       app: deepinsight-server
+#   policyTypes:
+#     - Ingress
+#     - Egress
+#   ingress:
+#     - from:
+#         - podSelector: {}
+#       ports:
+#         - protocol: TCP
+#           port: 8080
+#   egress:
+#     - to:
+#         - namespaceSelector: {}
+
+---
+# Monitoring: ServiceMonitor for Prometheus (TIER 2: Optional)
+# Uncomment if using Prometheus Operator
+# apiVersion: monitoring.coreos.com/v1
+# kind: ServiceMonitor
+# metadata:
+#   name: deepinsight
+#   namespace: rag-etl
+# spec:
+#   selector:
+#     matchLabels:
+#       app: deepinsight-server
+#   endpoints:
+#     - port: http
+#       interval: 30s
+#       path: /metrics
+
+---
+# Configuration for extended concurrency tuning (TIER 2)
+# Save as ConfigMap and reference in deployment if needed
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deepinsight-concurrency-config
+  namespace: rag-etl
+data:
+  # Pre-filter concurrency tuning
+  coarse-filter-concurrency: "10"   # Batch size for git grep (10 repos/batch)
+  coarse-filter-timeout-ms: "30000" # Timeout per git grep operation
+  
+  # Worker concurrency tuning
+  max-parallel-workers: "4"         # Pi agent parallel workers (4 for ≤30 symbols, 2 for >30)
+  max-target-repos: "10"            # Max repos to analyze (from pre-filter)
+  
+  # Timeout tuning
+  pi-worker-timeout-ms: "600000"    # Pi agent timeout (10 minutes)
+  pi-steer-ratio: "0.85"            # Steer signal at 85% of timeout
+  pi-stream-grace-ms: "15000"       # Grace period for final JSON output
+  
+  # Queue tuning
+  max-concurrent-tasks: "200"       # Max tasks in memory
+  task-max-age-days: "30"           # Auto-cleanup task age
+  
+  # LLM related
+  agents-md-max-chars: "40000"      # Max AGENTS.md size (~10K tokens)
+  
+  # NFS tuning (TIER 3)
+  nfs-cache-ttl-seconds: "300"      # Cache git grep results for 5 min
+

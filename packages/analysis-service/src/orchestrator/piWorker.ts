@@ -15,7 +15,6 @@ import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
-import type { AnalysisResult } from "@deepinsight/core";
 
 export interface PiWorkerConfig {
   /** LLM provider name for pi's --provider flag */
@@ -482,6 +481,17 @@ export function buildAnalysisPrompt(params: {
     keywords: string[];
     graphPath: string;
   }>;
+  /**
+   * Pre-fetched knowledge base results (Phase 1.5 T0 pre-flight).
+   * Service layer queried these before spawning pi; injected as background
+   * context so pi has answers from the first reasoning turn.
+   */
+  kbPrefetchResults?: Array<{
+    name: string;
+    description: string;
+    query: string;
+    answer: string;
+  }>;
 }): string {
   const parts: string[] = [];
 
@@ -504,9 +514,11 @@ ${params.diff}
   if (params.entryPointRepos && params.entryPointRepos.length > 0) {
     parts.push(`## 入口仓库（对外 API 层）
 以下仓库是系统对外暴露的 API 入口，必须分析变更是否通过调用链传递到这些入口：
-${params.entryPointRepos.map((r) => `- ${r} [ENTRY]`).join("\n")}
+${params.entryPointRepos.map((r) => `- ${r}`).join("\n")}
 
 即使变更符号未直接出现在入口仓库中，也要追踪中间层（如 frame/shared_lib）是否桥接了影响到入口 API。
+
+**输出时**：在 \`call_tree\` 中标记入口节点为 \`is_entry: true\`，并按规则填 \`entry_kind\`/\`entry_route\`（详见 SKILL.md Step 5）。**不要**在 \`domain_context\` 中写 \`[ENTRY]\` 文本。
 `);
   }
 
@@ -514,15 +526,16 @@ ${params.entryPointRepos.map((r) => `- ${r} [ENTRY]`).join("\n")}
   if (params.sinkRepos && params.sinkRepos.length > 0) {
     parts.push(`## 终点模块（最下层 / 下行链锚点）
 以下仓库是系统的终点/最下层模块（如 DAO/DB/存储），是下行链的优先收敛目标：
-${params.sinkRepos.map((r) => `- ${r} [SINK]`).join("\n")}
+${params.sinkRepos.map((r) => `- ${r}`).join("\n")}
 
-构建下行链：从变更符号向下游 callee 追踪，检查变更点对下游的调用是否仍满足契约（参数/异常/事务/schema）。
+构建下行链：从变更符号向下游 callee 追踪，检查变更点对下游的调用是否仍满足契约（参数/schema/事务）。
 追踪终止条件（每条路径独立判定，满足任一即停）：
-1. callee 属于 [SINK] → 标注 reachesSink=true 并给出 risk；
-2. callee 无下游调用（叶子）→ 自然停，reachesSink=false；
-3. 深度 ≥ 2 且该路径未朝 [SINK] 收敛 → 剪枝停；
+1. callee 属于终点仓 → 在 \`downstream_contracts[].sink\` 写入 \`{type, repo, priority, severity}\`；
+2. callee 无下游调用（叶子）→ 自然停，\`sink: null\`；
+3. 深度 ≥ 2 且该路径未朝终点收敛 → 剪枝停，\`sink: null\`；
 4. 深度 ≥ 4（绝对护栏）→ 无条件停。
-即 [SINK] 是优先收敛目标、可突破深度 2 追到（上限 4）；深度 2 仅是"既没到 sink、又判断不出朝 sink 走"时的兜底剪枝。
+即终点仓是优先收敛目标、可突破深度 2 追到（上限 4）；深度 2 仅是"既没到 sink、又判断不出朝 sink 走"时的兜底剪枝。
+\`status\` 取值：\`satisfied\` / \`uncertain\` / \`violated\`（注意是 \`satisfied\`，不是 \`ok\`）。
 `);
   }
 
@@ -538,7 +551,24 @@ ${params.globalPatterns}
 `);
   }
 
-  // Optional: advertise queryable knowledge bases (graphify graphs).
+  // Phase 1.5: inject pre-fetched KB results as background context.
+  // These were queried by the service layer before spawning pi (T0 pre-flight),
+  // so pi has the answers immediately without needing extra tool-call rounds.
+  if (params.kbPrefetchResults && params.kbPrefetchResults.length > 0) {
+    const lines: string[] = [];
+    lines.push("## 背景知识（已预检索）");
+    lines.push("");
+    lines.push("以下内容由系统在分析开始前根据 diff 关键词自动检索，可直接使用，无需重复查询：");
+    lines.push("");
+    for (const r of params.kbPrefetchResults) {
+      lines.push(`### ${r.name} — ${r.description}`);
+      lines.push(`> 检索问题：${r.query}`);
+      lines.push("");
+      lines.push(r.answer);
+      lines.push("");
+    }
+    parts.push(lines.join("\n"));
+  }
   // These are background corpora (design docs, runbooks, glossaries) that pi
   // can consult on demand — NOT injected directly to keep the prompt small.
   // Each library carries `keywords` so pi can route a query to the right one
@@ -590,19 +620,22 @@ ${params.globalPatterns}
 
 1. 解读 diff 语义，提取所有变更符号（忽略 test_*/Test* 测试函数），判断初始风险
 2. 使用 bash 工具运行 grep/find 在目标仓库中搜索调用点，构建完整跨仓调用链
-3. **必须追踪从 [ENTRY] 入口仓库到变更符号的完整调用路径**（包括通过 MQ/HTTP/框架调度的间接链路）
-4. **构建下行链**：从变更符号向下游 callee 追踪，检查对下游的调用契约是否仍成立，优先收敛到 [SINK]（见上方终止条件），输出 downstreamContracts
+3. **必须追踪从入口仓库到变更符号的完整调用路径**（包括通过 MQ/HTTP/框架调度的间接链路）
+4. **构建下行链**：从变更符号向下游 callee 追踪，检查对下游的调用契约是否仍成立，优先收敛到终点仓（见上方终止条件），输出 \`downstream_contracts\`
 5. 在调用链上传播风险（读取调用点代码判断领域上下文）
 6. 检查测试覆盖
-7. 输出结构化 JSON 报告
+7. 输出结构化 JSON 报告（**cross-repo-impact/2.0** schema，见 SKILL.md Step 5）
 
 **输出格式（严格遵守，否则结果会丢失）**：
 - 最终结果必须用 \`\`\`json ... \`\`\` 包裹
-- JSON 必须包含 summary.riskBreakdown（含 P0/P1/P2/P3/NEEDS_HUMAN_REVIEW 五个数字字段）
-- symbols 数组每个元素必须有 callTree（数组）和 riskTable（数组）；如有下行契约则带 downstreamContracts（数组，可为空）
-- callTree 从变更点逐层向上追踪到入口仓库
-- downstreamContracts 从变更点向下游追踪，reachesSink=true 时才填 risk
-- test_scenarios 放顶层
+- 顶层必须有 \`schema_version: "cross-repo-impact/2.0"\`、\`meta\`、\`changes\`、\`symbols\`、\`test_scenarios\`、\`unanalyzable\`
+- 所有字段名是 **snake_case**（如 \`call_tree\`、\`risk_table\`、\`downstream_contracts\`、\`diff_semantic\`、\`initial_severity\`）
+- 每个 \`symbols[]\` 必须有 \`id\`（\`SYM-001\`/\`SYM-002\`...）；\`test_scenarios[].id\` 用 \`RT-NNN\`；\`unanalyzable[].id\` 用 \`UA-NNN\`
+- \`call_tree\` 入口节点用 \`is_entry: true\` + \`entry_kind\` + \`entry_route\`（**禁止** \`[ENTRY]\` 字符串标记）
+- \`risk_table[]\` 同时填 \`priority\`（P0..P3）和 \`severity\`（high/medium/low）
+- \`downstream_contracts[]\`：\`status\` 用 \`satisfied\`/\`uncertain\`/\`violated\`；触达 sink 时 \`sink\` 填对象，否则 \`sink: null\`
+- \`test_scenarios[]\`：\`oracle\` 字典已废弃，改用 \`assertions[]\` 数组（每项一个闭合枚举 \`kind\`）；\`risk_change_ids\` 是数组、值为 \`SYM-NNN\` id；\`target_api\` 是结构化对象
+- \`unanalyzable[]\` 是结构化对象数组（带 \`id\`/\`category\`/\`subject\`/\`implication\`/\`suggested_handling\`），不是字符串列表
 - 严格按 SKILL.md Step 5 的 schema 示例输出
 `);
 

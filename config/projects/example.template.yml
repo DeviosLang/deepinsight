@@ -92,12 +92,14 @@ repos:
 #   prebuilt: true — graph.json already lives inside the repo at <repo>/<paths>/graphify-out/graph.json
 #     (e.g. every_thing_cvm ships pre-built graphs); indexer skips extract and only verifies presence.
 knowledge_base:
-  # Architecture / design decisions — built daily by the indexer
+  # Architecture / design decisions — built daily by the indexer.
+  # Path: ai_docs/cvm_docs/ (882 files)
+  # Previously used cvm_docs_v2/ (1879 files) which caused graphify ETIMEDOUT after 3600s.
   - name: "cvm_design_docs"
     repo: "ai_docs"
     type: "graphify"
     paths:
-      - "cvm_docs_v2/"
+      - "cvm_docs/"
     description: "CVM 平台架构决策、设计文档、glossary、pitfalls"
     keywords: ["架构", "设计决策", "design", "architecture", "glossary", "pitfall", "为什么"]
 
