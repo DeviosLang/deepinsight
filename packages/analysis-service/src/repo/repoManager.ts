@@ -280,6 +280,25 @@ export class RepoManager {
   }
 
   /**
+   * Get commit messages between two refs (base..head).
+   * Returns formatted multi-line string, one commit per line:
+   *   <short-hash> <subject>
+   *   (Body if present, indented)
+   * Returns empty string if refs are identical or on error.
+   */
+  getCommitMessages(repoName: string, base: string, head: string): string {
+    const repoPath = this.getRepoPath(repoName);
+    // %H = full hash, %s = subject, %b = body, %n = newline
+    const result = spawnSync(
+      "git",
+      ["log", `${base}..${head}`, "--pretty=format:%h %s%n%b", "--no-merges"],
+      { cwd: repoPath, timeout: 10_000, encoding: "utf-8" },
+    );
+    if (result.error || result.status !== 0) return "";
+    return result.stdout?.trim() ?? "";
+  }
+
+  /**
    * Create a temporary worktree on local fast storage (for ast-grep).
    * Returns the worktree path. Caller must call removeWorktree() when done.
    */

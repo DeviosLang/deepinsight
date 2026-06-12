@@ -1,19 +1,32 @@
 /**
- * Markdown renderer for AnalysisResult.
+ * Markdown renderer for the analysis result.
  *
  * Pure function — no fs, no fetch, no side effects. Used by:
  *   - GET /api/analyze/:taskId?format=markdown
  *   - scripts/render-report.ts (CLI)
  *
+ * Schema awareness:
+ *   - Primary target is cross-repo-impact/2.0 (snake_case, structured
+ *     unanalyzable + assertions + sink object, etc.).
+ *   - Falls back to the legacy AnalysisResult shape (camelCase, oracle dict,
+ *     untrackable string list) so a single renderer can survive the
+ *     migration window.
+ *   - Field resolution helpers (`pick`, `arr`) try snake_case first, then
+ *     camelCase, so a mixed/partial payload still renders sensibly.
+ *   - For the authoritative new ↔ legacy field cross-walk, see
+ *     @deepinsight/core src/types/index.ts §legacy-mapping. Every fallback
+ *     reader below carries an inline `// legacy: ...` reference into that
+ *     section. Update the table there first when adding a new field.
+ *
  * Design goals:
  *   1. Make the report consumable by reviewers without `jq` skills.
  *   2. Surface the actionable bits at the top: remediation checklist + test plan.
  *   3. Preserve all fidelity downward — full call tree, downstream contracts,
- *      untrackable items, run metadata. The reader can stop reading at any
+ *      unanalyzable items, run metadata. The reader can stop reading at any
  *      depth and still have what they need for that level of decision.
  *   4. Tolerate the LLM's loose JSON shape — fields may be missing, mistyped,
- *      or named in snake_case (test_scenarios) vs camelCase (callTree). We
- *      coerce defensively rather than crash on a malformed entry.
+ *      or named in either case style. We coerce defensively rather than crash
+ *      on a malformed entry.
  *
  * Not goals:
  *   - HTML/PDF output. Markdown only — terminals, GitLab/GitHub, Notion all
@@ -25,10 +38,11 @@
 // ─── Inputs (loose by design) ────────────────────────────────────────────────
 //
 // The renderer accepts `unknown`-ish input rather than the strict
-// `AnalysisResult` from @deepinsight/core. Reason: pi/LLM outputs frequently
-// drift from the schema (extra fields, missing optional fields, snake_case
-// alongside camelCase). Strict typing here would force callers to validate
-// upstream, when the renderer can simply degrade gracefully.
+// CrossRepoImpactArtifact / AnalysisResult from @deepinsight/core. Reason:
+// pi/LLM outputs frequently drift from the schema (extra fields, missing
+// optional fields, snake_case alongside camelCase). Strict typing here would
+// force callers to validate upstream, when the renderer can simply degrade
+// gracefully.
 
 type Unknown = Record<string, unknown>;
 
@@ -39,6 +53,54 @@ type Unknown = Record<string, unknown>;
  */
 function asArray<T = unknown>(v: unknown): T[] {
   return Array.isArray(v) ? (v as T[]) : [];
+}
+
+/** Try a list of keys on an object, return the first non-undefined value. */
+function pick<T = unknown>(obj: Unknown | undefined | null, ...keys: string[]): T | undefined {
+  if (!obj) return undefined;
+  for (const k of keys) {
+    if (obj[k] !== undefined) return obj[k] as T;
+  }
+  return undefined;
+}
+
+/** Return the first array-shaped value across the listed keys. */
+function arr<T = unknown>(obj: Unknown | undefined | null, ...keys: string[]): T[] {
+  for (const k of keys) {
+    const v = obj?.[k];
+    if (Array.isArray(v)) return v as T[];
+  }
+  return [];
+}
+
+/**
+ * Strip HTTP-method and path scaffolding from a route string, leaving just
+ * the meaningful identifier. Reviewers don't need to be told the method —
+ * the `transport: cloud_api` field already implies "POST /?Action=...".
+ *
+ * Examples:
+ *   "POST /?Action=RunInstances"       → "RunInstances"
+ *   "GET /?Action=DescribeInstances"   → "DescribeInstances"
+ *   "GET /api/v2/instances"            → "/api/v2/instances"
+ *   "POST /api/v1/foo?bar=1"           → "/api/v1/foo"
+ *   "RunInstances"                     → "RunInstances"  (no-op for already-bare names)
+ *
+ * Defensive: returns the input unchanged if the shape is unrecognized,
+ * so a malformed route value still renders something rather than nothing.
+ */
+function simplifyRoute(route: string): string {
+  if (!route) return route;
+  const trimmed = route.trim();
+  // Pull out an Action= parameter regardless of method or path style. This
+  // matches "?Action=Foo", "&Action=Foo" — case-insensitive on the key per
+  // some legacy clients that emit "action=".
+  const actionMatch = /[?&]action=([A-Za-z0-9_]+)/i.exec(trimmed);
+  if (actionMatch) return actionMatch[1];
+  // Otherwise, drop a leading "METHOD " (POST/GET/PUT/DELETE/PATCH) and any
+  // trailing query string, leaving the bare path.
+  const methodStripped = trimmed.replace(/^(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i, "");
+  const pathOnly = methodStripped.split("?")[0];
+  return pathOnly || trimmed;
 }
 
 interface RenderOptions {
@@ -68,7 +130,7 @@ export function renderMarkdown(
   };
 
   const sections: string[] = [];
-  sections.push(renderHeader(task));
+  sections.push(renderHeader(task, result));
   sections.push(renderSummary(result));
 
   const checklist = renderActionChecklist(result);
@@ -82,11 +144,14 @@ export function renderMarkdown(
   const mermaid = renderCallChainMermaid(result);
   if (mermaid) sections.push(mermaid);
 
-  const untrackable = renderUntrackable(result);
-  if (untrackable) sections.push(untrackable);
+  const unanalyzable = renderUnanalyzable(result);
+  if (unanalyzable) sections.push(unanalyzable);
 
   const globalPatterns = renderGlobalPatterns(result);
   if (globalPatterns) sections.push(globalPatterns);
+
+  const raw = renderRawOutput(result);
+  if (raw) sections.push(raw);
 
   if (opts.includeMeta) {
     const meta = renderMeta(result, task);
@@ -98,19 +163,22 @@ export function renderMarkdown(
 
 // ─── Header ──────────────────────────────────────────────────────────────────
 
-function renderHeader(task: Unknown): string {
+function renderHeader(task: Unknown, result: Unknown): string {
   const taskId = String(task.taskId ?? task.task_id ?? "(unknown)");
   const project = String(task.project ?? "");
   const status = String(task.status ?? "");
+  const schemaVersion = typeof result.schema_version === "string" ? result.schema_version : "";
 
   const lines: string[] = [`# 跨仓影响分析报告`];
   lines.push("");
   if (taskId !== "(unknown)") lines.push(`**Task ID**: \`${taskId}\``);
   if (project) lines.push(`**Project**: ${project}`);
   if (status) lines.push(`**Status**: ${statusEmoji(status)} ${status}`);
+  if (schemaVersion) lines.push(`**Schema**: \`${schemaVersion}\``);
 
-  // Changes (repo + branch + commits)
-  const changesRaw = task.changes;
+  // Changes (repo + branch + commits). Prefer task envelope, fall back to
+  // result.changes (new-schema artifact carries them at the top level too).
+  const changesRaw = task.changes ?? (result as Unknown).changes;
   const changes = asArray<Unknown>(changesRaw);
   if (changes.length > 0) {
     lines.push("");
@@ -118,8 +186,10 @@ function renderHeader(task: Unknown): string {
     for (const c of changes) {
       const repo = String(c.repo ?? "");
       const branch = c.branch ? ` \`${c.branch}\`` : "";
-      const commit = c.commit ? ` @ \`${shortHash(String(c.commit))}\`` : "";
-      const base = c.base ? ` (base: \`${shortHash(String(c.base))}\`)` : "";
+      const commitVal = pick<string>(c, "commit", "head_commit");
+      const commit = commitVal ? ` @ \`${shortHash(String(commitVal))}\`` : "";
+      const baseVal = pick<string>(c, "base", "base_commit");
+      const base = baseVal ? ` (base: \`${shortHash(String(baseVal))}\`)` : "";
       lines.push(`- ${repo}${branch}${commit}${base}`);
     }
   }
@@ -137,20 +207,29 @@ function renderHeader(task: Unknown): string {
 }
 
 // ─── Summary ─────────────────────────────────────────────────────────────────
+//
+// The new schema does not carry a `summary` block — we recompute counts from
+// the symbols + risk_table arrays. The legacy schema's summary is read
+// verbatim when present (preserving any LLM-tuned counts).
 
 function renderSummary(result: Unknown): string {
   const summary = (result.summary as Unknown) ?? {};
   const rb = (summary.riskBreakdown as Unknown) ?? {};
+  const symbols = asArray<Unknown>(result.symbols);
 
-  const totalSymbols = Number(summary.totalSymbolsChanged ?? 0);
-  const affected = Number(summary.affectedRepos ?? 0);
+  // Recompute when summary is absent (new schema). Falls through to legacy
+  // values when they exist.
+  const computed = computeSummary(symbols);
+
+  const totalSymbols = Number(summary.totalSymbolsChanged ?? computed.totalSymbols);
+  const affected = Number(summary.affectedRepos ?? computed.affectedRepos);
   const unaffected = Number(summary.unaffectedRepos ?? 0);
 
-  const p0 = Number(rb.P0 ?? 0);
-  const p1 = Number(rb.P1 ?? 0);
-  const p2 = Number(rb.P2 ?? 0);
-  const p3 = Number(rb.P3 ?? 0);
-  const human = Number(rb.NEEDS_HUMAN_REVIEW ?? 0);
+  const p0 = Number(rb.P0 ?? computed.breakdown.P0);
+  const p1 = Number(rb.P1 ?? computed.breakdown.P1);
+  const p2 = Number(rb.P2 ?? computed.breakdown.P2);
+  const p3 = Number(rb.P3 ?? computed.breakdown.P3);
+  const human = Number(rb.NEEDS_HUMAN_REVIEW ?? computed.breakdown.NEEDS_HUMAN_REVIEW);
 
   const lines: string[] = [`## 📊 Summary`];
   lines.push("");
@@ -175,20 +254,59 @@ function renderSummary(result: Unknown): string {
   return lines.join("\n");
 }
 
+/**
+ * Recompute totals from symbols. Used when the new-schema artifact omits
+ * `summary` (which the renderer should still display).
+ */
+function computeSummary(symbols: Unknown[]) {
+  const breakdown = { P0: 0, P1: 0, P2: 0, P3: 0, NEEDS_HUMAN_REVIEW: 0 } as Record<string, number>;
+  const repos = new Set<string>();
+
+  for (const sym of symbols) {
+    const callTree = arr<Unknown>(sym, "call_tree", "callTree");
+    for (const n of callTree) {
+      const repo = String(n.repo ?? "");
+      if (repo) repos.add(repo);
+    }
+    const dc = arr<Unknown>(sym, "downstream_contracts", "downstreamContracts");
+    for (const c of dc) {
+      const repo = String(c.repo ?? "");
+      if (repo) repos.add(repo);
+      const sink = c.sink as Unknown | null | undefined;
+      if (sink && typeof sink === "object" && typeof sink.repo === "string") {
+        repos.add(sink.repo);
+      }
+      const sinkRepo = c.sinkRepo;
+      if (typeof sinkRepo === "string" && sinkRepo) repos.add(sinkRepo);
+    }
+    const riskTable = arr<Unknown>(sym, "risk_table", "riskTable");
+    for (const r of riskTable) {
+      const p = String(r.priority ?? "");
+      if (p in breakdown) breakdown[p] += 1;
+    }
+  }
+
+  return {
+    totalSymbols: symbols.length,
+    affectedRepos: repos.size,
+    breakdown,
+  };
+}
+
 // ─── Action checklist (P0 + P1 remediation) ──────────────────────────────────
 
 function renderActionChecklist(result: Unknown): string {
   const symbols = asArray<Unknown>(result.symbols);
   const blockers: string[] = []; // P0 + sink-reaching P0 contracts
   const required: string[] = []; // P1
-  const sinkOps: string[] = []; // downstreamContracts with reachesSink=true and risk
+  const sinkOps: string[] = []; // downstream contracts touching a sink with P0/P1
 
   for (const sym of symbols) {
     const symName = String(sym.name ?? "");
     const symLoc = String(sym.location ?? "");
 
-    // From riskTable (the reviewer-facing remediation list)
-    const riskTable = asArray<Unknown>(sym.riskTable);
+    // From risk_table (the reviewer-facing remediation list)
+    const riskTable = arr<Unknown>(sym, "risk_table", "riskTable");
     for (const r of riskTable) {
       const priority = String(r.priority ?? "");
       const remediation = String(r.remediation ?? "").trim();
@@ -200,19 +318,34 @@ function renderActionChecklist(result: Unknown): string {
       else if (priority === "P1") required.push(item);
     }
 
-    // Sink-reaching downstream contracts (DB schema, Redis, etc.)
-    const dc = asArray<Unknown>(sym.downstreamContracts);
+    // Sink-reaching downstream contracts. Two shapes supported:
+    //  - new schema: `sink: {type, repo, priority?, severity?} | null`
+    //  - legacy:    `reachesSink: bool, sinkRepo: string, risk: P0..P3`
+    const dc = arr<Unknown>(sym, "downstream_contracts", "downstreamContracts");
     for (const c of dc) {
-      const reachesSink = c.reachesSink === true;
-      const risk = String(c.risk ?? "");
       const detail = String(c.detail ?? "").trim();
-      if (!reachesSink || !detail) continue;
-      // Only surface as action if it carries P0/P1; lower-risk sink contracts
-      // are still in the per-symbol detail section below.
-      if (risk !== "P0" && risk !== "P1") continue;
+      if (!detail) continue;
+
+      // Resolve "does this reach a sink" + "what priority"
+      const sinkObj = c.sink as Unknown | null | undefined;
+      let reaches = false;
+      let priority = "";
+      let sinkRepo = "";
+      if (sinkObj && typeof sinkObj === "object") {
+        reaches = true;
+        priority = String(sinkObj.priority ?? "");
+        sinkRepo = String(sinkObj.repo ?? "");
+      } else if (c.reachesSink === true) {
+        reaches = true;
+        priority = String(c.risk ?? "");
+        sinkRepo = String(c.sinkRepo ?? "");
+      }
+      if (!reaches) continue;
+      if (priority !== "P0" && priority !== "P1") continue;
+
       const callee = String(c.callee ?? "");
-      const sinkRepo = c.sinkRepo ? ` → \`${c.sinkRepo}\`` : "";
-      sinkOps.push(`**Sink**: ${callee}${sinkRepo} — ${detail}`);
+      const repoTail = sinkRepo ? ` → \`${sinkRepo}\`` : "";
+      sinkOps.push(`**Sink**: ${callee}${repoTail} — ${detail}`);
     }
   }
 
@@ -256,17 +389,62 @@ function renderTestPlanChecklist(result: Unknown): string {
 
   scenarios.forEach((s, i) => {
     const name = String(s.scenario ?? `scenario-${i + 1}`);
-    const riskId = s.risk_change_id ?? s.riskChangeId;
-    const api = s.affected_api ?? s.affectedApi;
-    lines.push(`### ${i + 1}. ${name}`);
+    const id = typeof s.id === "string" ? s.id : "";
+
+    // risk_change_ids is an array in the new schema; risk_change_id was a
+    // singular string in the legacy schema. Normalize to a list for display.
+    const riskIdsRaw = (s.risk_change_ids ?? s.riskChangeIds) as unknown;
+    let riskIds: string[];
+    if (Array.isArray(riskIdsRaw)) {
+      riskIds = riskIdsRaw.map(String);
+    } else if (s.risk_change_id !== undefined || s.riskChangeId !== undefined) {
+      riskIds = [String(s.risk_change_id ?? s.riskChangeId)];
+    } else {
+      riskIds = [];
+    }
+
+    // target_api (object, new) vs affected_api (string, legacy)
+    const targetApi = s.target_api as Unknown | undefined;
+    const apiLegacy = s.affected_api ?? s.affectedApi;
+
+    const heading = id ? `### ${i + 1}. \`${id}\` ${name}` : `### ${i + 1}. ${name}`;
+    lines.push(heading);
     lines.push("");
-    if (riskId) lines.push(`**关联变更**: \`${riskId}\``);
-    if (api) lines.push(`**入口 API**: \`${api}\``);
+    if (riskIds.length > 0) {
+      lines.push(`**关联变更**: ${riskIds.map((r) => `\`${r}\``).join(", ")}`);
+    }
+    if (targetApi && typeof targetApi === "object") {
+      const apiName = String(targetApi.name ?? "");
+      const ns = targetApi.namespace ? `\`${targetApi.namespace}\`` : "";
+      const transport = targetApi.transport ? ` / ${targetApi.transport}` : "";
+      const rawRoute = targetApi.route ? String(targetApi.route) : "";
+      const simplified = simplifyRoute(rawRoute);
+      // Only show route segment if it adds info beyond apiName — otherwise
+      // it's just a duplicate (the common case for cloud_api Action routes).
+      const route = simplified && simplified !== apiName ? ` — \`${simplified}\`` : "";
+      const annotation = targetApi.annotation ? ` ${escapeCell(String(targetApi.annotation))}` : "";
+      const parts = [apiName && `\`${apiName}\``, ns + transport, route, annotation].filter(Boolean).join(" ");
+      if (parts) lines.push(`**目标 API**: ${parts}`);
+    } else if (apiLegacy) {
+      lines.push(`**入口 API**: \`${apiLegacy}\``);
+    }
+
+    // api_params (display when non-trivial)
+    const apiParams = s.api_params as Unknown | undefined;
+    if (apiParams && typeof apiParams === "object" && Object.keys(apiParams).length > 0) {
+      lines.push("");
+      lines.push(`**Params**:`);
+      lines.push("");
+      lines.push("```json");
+      lines.push(JSON.stringify(apiParams, null, 2));
+      lines.push("```");
+    }
+
     lines.push("");
 
     // Preconditions
     const pre = asArray(s.preconditions);
-    if (Array.isArray(pre) && pre.length > 0) {
+    if (pre.length > 0) {
       lines.push(`**Preconditions**:`);
       for (const p of pre) lines.push(`- ${String(p)}`);
       lines.push("");
@@ -274,23 +452,42 @@ function renderTestPlanChecklist(result: Unknown): string {
 
     // Steps
     const steps = asArray(s.steps);
-    if (Array.isArray(steps) && steps.length > 0) {
+    if (steps.length > 0) {
       lines.push(`**Steps**:`);
       for (const step of steps) lines.push(`- [ ] ${String(step)}`);
       lines.push("");
     }
 
-    // Oracle
-    const oracle = s.oracle;
-    if (oracle && typeof oracle === "object" && oracle !== null) {
-      lines.push(`**Oracle (验证规则)**:`);
-      for (const [k, v] of Object.entries(oracle as Unknown)) {
-        lines.push(`- \`${k}\`: ${String(v)}`);
+    // Assertions (new schema) vs Oracle (legacy)
+    const assertions = asArray<Unknown>(s.assertions);
+    if (assertions.length > 0) {
+      lines.push(`**Assertions (验证规则)**:`);
+      lines.push("");
+      lines.push("| Kind | Channel | Severity | 表达式 / 描述 |");
+      lines.push("|---|---|---|---|");
+      for (const a of assertions) {
+        const kind = String(a.kind ?? "");
+        const channel = String(a.channel ?? "");
+        const severity = String(a.severity ?? "");
+        const expr = String(a.expression ?? "");
+        const human = a.human_description ? ` _(${escapeCell(String(a.human_description))})_` : "";
+        lines.push(
+          `| \`${kind}\` | \`${channel}\` | ${assertionSeverityBadge(severity)} ${severity} | \`${escapeCell(expr)}\`${human} |`,
+        );
       }
       lines.push("");
-    } else if (typeof oracle === "string" && oracle) {
-      lines.push(`**Oracle**: ${oracle}`);
-      lines.push("");
+    } else {
+      const oracle = s.oracle;
+      if (oracle && typeof oracle === "object" && oracle !== null) {
+        lines.push(`**Oracle (验证规则)**:`);
+        for (const [k, v] of Object.entries(oracle as Unknown)) {
+          lines.push(`- \`${k}\`: ${String(v)}`);
+        }
+        lines.push("");
+      } else if (typeof oracle === "string" && oracle) {
+        lines.push(`**Oracle**: ${oracle}`);
+        lines.push("");
+      }
     }
   });
 
@@ -309,13 +506,17 @@ function renderSymbols(result: Unknown, opts: Required<RenderOptions>): string {
   const lines: string[] = [`## 📍 Symbols (${symbols.length})`];
 
   symbols.forEach((sym, i) => {
+    const id = typeof sym.id === "string" ? sym.id : "";
     const name = String(sym.name ?? `symbol-${i + 1}`);
     const location = String(sym.location ?? "");
-    const initialRisk = String(sym.initialRisk ?? "");
-    const diffSemantic = String(sym.diffSemantic ?? "").trim();
+    // legacy: initialRisk → initial_severity (word change: risk→severity).
+    // See @deepinsight/core types/index.ts §legacy-mapping.
+    const initialRisk = String(pick(sym, "initial_severity", "initialRisk") ?? "");
+    // legacy: diffSemantic → diff_semantic. See §legacy-mapping.
+    const diffSemantic = String(pick<string>(sym, "diff_semantic", "diffSemantic") ?? "").trim();
 
     lines.push("");
-    lines.push(`### ${i + 1}. \`${name}\``);
+    lines.push(id ? `### ${i + 1}. \`${id}\` \`${name}\`` : `### ${i + 1}. \`${name}\``);
     lines.push("");
     if (location) lines.push(`**位置**: \`${location}\``);
     if (initialRisk) lines.push(`**初始风险**: ${riskBadge(initialRisk)} ${initialRisk}`);
@@ -327,22 +528,27 @@ function renderSymbols(result: Unknown, opts: Required<RenderOptions>): string {
     }
 
     // Risk table
-    const riskTable = asArray<Unknown>(sym.riskTable);
+    const riskTable = arr<Unknown>(sym, "risk_table", "riskTable");
     if (riskTable.length > 0) {
       lines.push("");
       lines.push(`**风险优先级**:`);
       lines.push("");
-      lines.push("| 优先级 | 位置 | 函数 | 经由 | 风险 | 测试 | 处置建议 |");
+      lines.push("| 优先级 | 严重度 | 位置 | 函数 | 经由 | 测试 | 处置建议 |");
       lines.push("|---|---|---|---|---|---|---|");
       for (const r of riskTable) {
+        // legacy: risk → severity (★ semantic word change: risk→severity).
+        // See @deepinsight/core types/index.ts §legacy-mapping.
+        const severity = String(pick(r, "severity", "risk") ?? "");
+        // legacy: testCoverage → test_coverage. See §legacy-mapping.
+        const cov = String(pick(r, "test_coverage", "testCoverage") ?? "");
         lines.push(
-          `| ${String(r.priority ?? "")} | \`${String(r.location ?? "")}\` | \`${String(r.function ?? "")}\` | ${escapeCell(String(r.via ?? ""))} | ${riskBadge(String(r.risk ?? ""))} ${String(r.risk ?? "")} | ${testCovBadge(String(r.testCoverage ?? ""))} | ${escapeCell(String(r.remediation ?? ""))} |`,
+          `| ${String(r.priority ?? "")} | ${riskBadge(severity)} ${severity} | \`${String(r.location ?? "")}\` | \`${String(r.function ?? "")}\` | ${escapeCell(String(r.via ?? ""))} | ${testCovBadge(cov)} | ${escapeCell(String(r.remediation ?? ""))} |`,
         );
       }
     }
 
     // Call tree
-    const callTree = asArray<Unknown>(sym.callTree);
+    const callTree = arr<Unknown>(sym, "call_tree", "callTree");
     if (callTree.length > 0) {
       lines.push("");
       lines.push(`**调用链 (${callTree.length} 节点)**:`);
@@ -355,41 +561,123 @@ function renderSymbols(result: Unknown, opts: Required<RenderOptions>): string {
         const file = String(node.file ?? "");
         const line = node.line ?? "";
         const fn = String(node.function ?? "");
-        const callType = String(node.callType ?? "");
-        const risk = String(node.risk ?? "");
-        const testCov = String(node.testCoverage ?? "");
+        // legacy: callType → call_type. See @deepinsight/core types/index.ts §legacy-mapping.
+        const callType = String(pick(node, "call_type", "callType") ?? "");
+        // legacy: risk → priority (★ semantic shift: in v1 a node's .risk
+        // was action urgency P0..P3; in 2.0 that's now .priority and severity
+        // is a separate field. See §legacy-mapping.)
+        const priority = String(pick(node, "priority", "risk") ?? "");
+        // legacy: testCoverage → test_coverage. See §legacy-mapping.
+        const testCov = String(pick(node, "test_coverage", "testCoverage") ?? "");
         const via = node.via ? ` via: ${String(node.via)}` : "";
-        const ctx = node.domainContext ? ` [${String(node.domainContext)}]` : "";
+        // is_entry replaces the legacy "[ENTRY]" string in domain_context.
+        const isEntry = node.is_entry === true;
+        const isPrimary = node.is_primary_entry === true;
+        const entryKind = node.entry_kind ? String(node.entry_kind) : "";
+        const entryRoute = node.entry_route ? simplifyRoute(String(node.entry_route)) : "";
+        let entryTag = "";
+        if (isEntry) {
+          const star = isPrimary ? "*" : "";
+          const kindPart = entryKind ? ` ${entryKind}` : "";
+          const routePart = entryRoute ? `: ${entryRoute}` : "";
+          entryTag = ` [ENTRY${star}${kindPart}${routePart}]`;
+        }
+        const ctx = pick(node, "domain_context", "domainContext");
+        // legacy: domainContext → domain_context. See @deepinsight/core types/index.ts §legacy-mapping.
+        const ctxLabel = ctx ? ` [${String(ctx)}]` : "";
         lines.push(
-          `${indent}└─ ${repo}/${file}:${line}  ${fn}  (${callType}, ${risk}, ${testCov})${ctx}${via}`,
+          `${indent}└─ ${repo}/${file}:${line}  ${fn}  (${callType}, ${priority}, ${testCov})${entryTag}${ctxLabel}${via}`,
         );
       }
       lines.push("```");
     }
 
     // Downstream contracts
-    const dc = asArray<Unknown>(sym.downstreamContracts);
+    const dc = arr<Unknown>(sym, "downstream_contracts", "downstreamContracts");
     if (dc.length > 0) {
       lines.push("");
       lines.push(`**下行契约 (${dc.length})**:`);
       lines.push("");
-      lines.push("| Callee | 类型 | Kind | 状态 | 触达 Sink | 风险 | 详情 |");
+      lines.push("| Callee | 类型 | Kind | 状态 | Sink | 优先级 | 详情 |");
       lines.push("|---|---|---|---|---|---|---|");
       for (const c of dc) {
         const callee = String(c.callee ?? "");
-        const callType = String(c.callType ?? "");
-        const kind = String(c.contractKind ?? "");
+        // legacy: callType → call_kind (★ enum tightened in 2.0; see CallKind
+        // vs CallType). See @deepinsight/core types/index.ts §legacy-mapping.
+        const callKind = String(pick(c, "call_kind", "callType") ?? "");
+        // legacy: contractKind → contract_kind. See §legacy-mapping.
+        const kind = String(pick(c, "contract_kind", "contractKind") ?? "");
         const status = String(c.status ?? "");
-        const reaches = c.reachesSink === true ? `✅ ${String(c.sinkRepo ?? "")}` : "—";
-        const risk = c.risk ? `${riskBadge(String(c.risk))} ${String(c.risk)}` : "—";
+
+        // sink: new = object | null; legacy = reachesSink + sinkRepo + risk
+        const sinkObj = c.sink as Unknown | null | undefined;
+        let sinkCell = "—";
+        let priorityCell = "—";
+        if (sinkObj && typeof sinkObj === "object") {
+          const sinkType = String(sinkObj.type ?? "");
+          const sinkRepo = String(sinkObj.repo ?? "");
+          const tail = [sinkType && `\`${sinkType}\``, sinkRepo && `\`${sinkRepo}\``]
+            .filter(Boolean)
+            .join(" ");
+          sinkCell = `✅ ${tail}`;
+          const sinkPriority = sinkObj.priority ? String(sinkObj.priority) : "";
+          if (sinkPriority) priorityCell = `${riskBadge(sinkPriority)} ${sinkPriority}`;
+        } else if (c.reachesSink === true) {
+          // Legacy
+          sinkCell = `✅ ${String(c.sinkRepo ?? "")}`;
+          if (c.risk) priorityCell = `${riskBadge(String(c.risk))} ${String(c.risk)}`;
+        }
+
         const detail = String(c.detail ?? "");
         lines.push(
-          `| \`${callee}\` | ${callType} | ${kind} | ${statusBadge(status)} ${status} | ${reaches} | ${risk} | ${escapeCell(detail)} |`,
+          `| \`${callee}\` | ${callKind} | ${kind} | ${statusBadge(status)} ${status} | ${sinkCell} | ${priorityCell} | ${escapeCell(detail)} |`,
         );
       }
     }
   });
 
+  return lines.join("\n");
+}
+
+// ─── Unanalyzable (new structured shape) / untrackable (legacy strings) ──────
+
+function renderUnanalyzable(result: Unknown): string {
+  // Prefer new schema. Fall through to legacy untrackable string list.
+  const items = asArray<unknown>(result.unanalyzable);
+  if (items.length > 0) {
+    const lines: string[] = [`## ⚠️ 无法静态追踪 (${items.length})`];
+    lines.push("");
+    lines.push("> 以下项静态分析无法覆盖,需要人工确认或运行时观察");
+    lines.push("");
+    lines.push("| ID | 类别 | 主题 | 影响 | 处置 |");
+    lines.push("|---|---|---|---|---|");
+    for (const raw of items) {
+      if (typeof raw === "string") {
+        // Tolerate a stray string entry in the new array.
+        lines.push(`| — | — | ${escapeCell(raw)} | — | — |`);
+        continue;
+      }
+      const u = raw as Unknown;
+      const id = String(u.id ?? "");
+      const cat = String(u.category ?? "");
+      const subject = String(u.subject ?? "");
+      const implication = String(u.implication ?? "");
+      const handling = String(u.suggested_handling ?? "");
+      lines.push(
+        `| \`${id}\` | \`${cat}\` | ${escapeCell(subject)} | ${escapeCell(implication)} | \`${handling}\` |`,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  // Legacy: untrackable is a string list.
+  const legacy = asArray<unknown>(result.untrackable);
+  if (legacy.length === 0) return "";
+  const lines: string[] = [`## ⚠️ 无法静态追踪 (${legacy.length})`];
+  lines.push("");
+  lines.push("> 以下项静态分析无法覆盖,需要人工确认或运行时观察");
+  lines.push("");
+  for (const item of legacy) lines.push(`- ${String(item)}`);
   return lines.join("\n");
 }
 
@@ -449,7 +737,8 @@ function renderCallChainMermaid(result: Unknown): string {
     const rootId = safeMermaidId(`root_${symName}`);
     rootIds.set(symName, rootId);
 
-    const callTree = asArray<Unknown>(sym.callTree);
+    // New schema uses snake_case `call_tree`; legacy uses `callTree`.
+    const callTree = arr<Unknown>(sym, "call_tree", "callTree");
 
     // Track the last-seen node id at each depth so we can wire up parents.
     const depthStack = new Map<number, string>();
@@ -462,7 +751,9 @@ function renderCallChainMermaid(result: Unknown): string {
       const file = String(node.file ?? "");
       const line = node.line ?? "";
       const fn = String(node.function ?? `node_${i}`);
-      const risk = String(node.risk ?? "");
+      // v2 splits legacy `risk` into `priority` (urgency) on call-tree nodes;
+      // colour by whichever is present.
+      const risk = String(pick(node, "priority", "risk") ?? "");
 
       const id = safeMermaidId(`n_${symName}_${i}_${fn}`);
       // Parent = closest ancestor at depth-1; fall back to root if not found.
@@ -553,26 +844,29 @@ function escapeQuote(s: string): string {
   return s.replace(/"/g, "&quot;");
 }
 
-// ─── Untrackable ─────────────────────────────────────────────────────────────
-function renderUntrackable(result: Unknown): string {
-  const items = asArray(result.untrackable);
-  if (!Array.isArray(items) || items.length === 0) return "";
-  const lines: string[] = [`## ⚠️ 无法静态追踪 (${items.length})`];
-  lines.push("");
-  lines.push("> 以下项静态分析无法覆盖,需要人工确认或运行时观察");
+// ─── Global patterns ─────────────────────────────────────────────────────────
+
+function renderGlobalPatterns(result: Unknown): string {
+  const items = arr<unknown>(result, "global_patterns_matched", "globalPatternsMatched");
+  if (items.length === 0) return "";
+  const lines: string[] = [`## 🔁 历史风险模式匹配 (${items.length})`];
   lines.push("");
   for (const item of items) lines.push(`- ${String(item)}`);
   return lines.join("\n");
 }
 
-// ─── Global patterns ─────────────────────────────────────────────────────────
+// ─── Raw output (only present on JSON-extraction failure) ────────────────────
 
-function renderGlobalPatterns(result: Unknown): string {
-  const items = asArray(result.globalPatternsMatched);
-  if (!Array.isArray(items) || items.length === 0) return "";
-  const lines: string[] = [`## 🔁 历史风险模式匹配 (${items.length})`];
+function renderRawOutput(result: Unknown): string {
+  const raw = result._rawOutput;
+  if (typeof raw !== "string" || !raw) return "";
+  const lines: string[] = [`## 🪵 原始输出 (JSON 解析失败)`];
   lines.push("");
-  for (const item of items) lines.push(`- ${String(item)}`);
+  lines.push("> pi 未输出有效的 cross-repo-impact JSON。以下是原始输出尾部，供人工排查。");
+  lines.push("");
+  lines.push("```");
+  lines.push(raw);
+  lines.push("```");
   return lines.join("\n");
 }
 
@@ -629,7 +923,9 @@ function statusEmoji(status: string): string {
 }
 
 function riskBadge(risk: string): string {
-  // Accept both severity (high/medium/low) and priority (P0/P1/P2/P3).
+  // Accept both severity (high/medium/low/critical/info) and priority (P0/P1/P2/P3).
+  // critical/info preserved for legacy InitialRisk values; new schema's
+  // initial_severity is high/medium/low only.
   const r = risk.toLowerCase();
   if (r === "p0" || r === "critical" || r === "high") return "🔴";
   if (r === "p1") return "🟠";
@@ -649,9 +945,18 @@ function testCovBadge(cov: string): string {
 
 function statusBadge(status: string): string {
   const s = status.toLowerCase();
-  if (s === "ok" || s === "compatible") return "✅";
+  // satisfied (new) and ok (legacy) both indicate "contract holds".
+  if (s === "ok" || s === "satisfied" || s === "compatible") return "✅";
   if (s === "violated") return "❌";
   if (s === "uncertain") return "⚠️";
+  return "•";
+}
+
+function assertionSeverityBadge(sev: string): string {
+  const s = sev.toLowerCase();
+  if (s === "must") return "🔴";
+  if (s === "should") return "🟡";
+  if (s === "informational") return "🟢";
   return "•";
 }
 
