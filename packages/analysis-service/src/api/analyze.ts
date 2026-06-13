@@ -4,9 +4,11 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import YAML from "yaml";
 import type { FastifyInstance } from "fastify";
 import type { AnalysisTask, ChangeSpec, AnalysisOptions } from "@deepinsight/core";
 import { runAnalysisPipeline, loadPipelineConfig } from "../orchestrator/pipeline.js";
+import { RepoManager } from "../repo/repoManager.js";
 import { renderMarkdown } from "../render/markdown.js";
 
 // Persistent task store — writes to NFS for Pod restart survival
@@ -302,6 +304,29 @@ function getFreshestTask(taskId: string): AnalysisTask | null {
   return inMemory;
 }
 
+/**
+ * Normalize the `repo` field of a ChangeSpec.
+ *
+ * Users may paste a full HTTP(S) git URL instead of the bare NFS directory
+ * name that the pipeline expects. This function strips the protocol + host +
+ * path prefix and the optional `.git` suffix so both forms are accepted:
+ *
+ *   "http://git.woa.com/vstation/image.git"  →  "image"
+ *   "https://git.woa.com/vstation/image"     →  "image"
+ *   "image"                                  →  "image"  (pass-through)
+ *
+ * SSH URLs (git@...) are deliberately NOT handled — the service uses HTTP
+ * OAuth tokens, so SSH URLs should never appear. If they do, the string is
+ * returned as-is and `repoExists()` will produce a clear "not found" error.
+ */
+function normalizeRepo(repo: string): string {
+  if (repo.startsWith("http://") || repo.startsWith("https://")) {
+    const lastSegment = repo.split("/").filter(Boolean).at(-1) ?? repo;
+    return lastSegment.replace(/\.git$/i, "");
+  }
+  return repo;
+}
+
 interface AnalyzeBody {
   project: string;
   changes: ChangeSpec[];
@@ -319,13 +344,16 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: "project and changes are required" });
     }
 
+    // Normalize repo fields: accept full HTTP(S) URLs as well as bare names.
+    const normalizedChanges = changes.map((c) => ({ ...c, repo: normalizeRepo(c.repo) }));
+
     const taskId = `analysis-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
     const task: AnalysisTask = {
       taskId,
       project,
       status: "queued",
-      changes,
+      changes: normalizedChanges,
       options: options ?? {},
       createdAt: new Date().toISOString(),
     };
@@ -454,6 +482,76 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
         hasResult: !!t.result,
       })),
     };
+  });
+
+  // ─── GET /repos ───────────────────────────────────────────────────────────
+  // Returns the list of available repos with role annotations from config.
+  //
+  // Supports two project config shapes:
+  //   (A) New list form: repos: [{name, url, role}, ...]
+  //   (B) Legacy map form: repos: {entry_points: [...], sinks: [...]}
+  //       — used by the deployed config; NFS names are the source of truth.
+  //
+  // Response shape:
+  //   {
+  //     repos: [
+  //       { name: "vstation_image", role: "entry_point" },
+  //       { name: "vstation_frame" },
+  //       ...
+  //     ]
+  //   }
+  app.get("/repos", async (_req, reply) => {
+    reply.header("X-Pod-Name", POD_NAME);
+
+    // Build role map from project config (best-effort; config may be absent).
+    // Supports both list (new) and map/legacy formats.
+    const roleMap = new Map<string, string>(); // name → role
+    const urlMap = new Map<string, string>();  // name → url (list format only)
+    const projectConfigPath = process.env.PROJECT_CONFIG_PATH ?? "/etc/deepinsight/project.yml";
+    try {
+      const rawYaml = fs.readFileSync(projectConfigPath, "utf-8");
+      const config = YAML.parse(rawYaml) as Record<string, unknown>;
+      const rawRepos = config.repos;
+
+      if (Array.isArray(rawRepos)) {
+        // Shape (A): [{name, url?, role?}, ...]
+        for (const item of rawRepos) {
+          if (typeof item !== "object" || item === null) continue;
+          const r = item as Record<string, unknown>;
+          if (typeof r.name !== "string") continue;
+          if (typeof r.role === "string") roleMap.set(r.name, r.role);
+          if (typeof r.url === "string") urlMap.set(r.name, r.url);
+        }
+      } else if (typeof rawRepos === "object" && rawRepos !== null) {
+        // Shape (B): {entry_points: [...], sinks: [...]}
+        const m = rawRepos as Record<string, unknown>;
+        if (Array.isArray(m.entry_points)) {
+          for (const x of m.entry_points) roleMap.set(String(x), "entry_point");
+        }
+        if (Array.isArray(m.sinks)) {
+          for (const x of m.sinks) roleMap.set(String(x), "sink");
+        }
+      }
+    } catch {
+      // Config absent or unreadable — return NFS list without role annotations.
+    }
+
+    // All repos available on NFS — this is the authoritative list of what
+    // `changes[].repo` can reference.
+    const repoManager = new RepoManager({ workspaceDir: pipelineConfig.workspaceDir });
+    const nfsNames = repoManager.listRepos().sort();
+
+    const repos = nfsNames.map((name) => {
+      // Prefer URL from config (list format); fall back to git remote (strips credentials).
+      const url = urlMap.get(name) ?? repoManager.getRemoteUrl(name) ?? undefined;
+      return {
+        name,
+        ...(url ? { url } : {}),
+        ...(roleMap.has(name) ? { role: roleMap.get(name) } : {}),
+      };
+    });
+
+    return { repos };
   });
 }
 

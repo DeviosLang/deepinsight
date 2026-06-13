@@ -62,6 +62,27 @@ export class RepoManager {
   }
 
   /**
+   * Get the git remote URL for a repo, with credentials stripped.
+   *
+   * The workspace remote URLs embed OAuth tokens for TGit access:
+   *   http://oauth2:<token>@git.woa.com/vstation/image.git
+   * We strip the `user:password@` portion before returning so the URL is
+   * safe to include in API responses without leaking secrets.
+   *
+   * Returns null if the repo has no remote or git fails.
+   */
+  getRemoteUrl(repoName: string): string | null {
+    const repoPath = this.getRepoPath(repoName);
+    const result = spawnSync("git", ["-C", repoPath, "remote", "get-url", "origin"], {
+      encoding: "utf-8",
+      timeout: 5_000,
+    });
+    if (result.status !== 0 || !result.stdout.trim()) return null;
+    // Strip embedded credentials: http://user:pass@host → http://host
+    return result.stdout.trim().replace(/^(https?:\/\/)[^@]+@/, "$1");
+  }
+
+  /**
    * Run git grep on a repo (works on NFS — sequential reads are tolerable).
    * Searches the working tree (HEAD) for the given pattern.
    *
