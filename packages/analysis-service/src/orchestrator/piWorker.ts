@@ -851,6 +851,18 @@ export async function runPiWorkerWithRetry(
       return lastResult;
     }
 
+    // Rate limit — longer backoff, always retry (don't count against MAX_RETRIES logic)
+    const isRateLimit =
+      lastResult.error?.includes("429") ||
+      lastResult.error?.toLowerCase().includes("rate limit") ||
+      lastResult.error?.toLowerCase().includes("too many requests");
+    if (isRateLimit) {
+      const rlDelay = 15_000 + Math.random() * 10_000; // 15-25s
+      console.log(`[pi:retry] Rate limited on attempt ${attempt}, backing off ${Math.round(rlDelay)}ms...`);
+      await new Promise((resolve) => setTimeout(resolve, rlDelay));
+      continue;
+    }
+
     // Last attempt — don't retry
     if (attempt >= MAX_RETRIES) {
       console.log(`[pi:retry] Failed after ${MAX_RETRIES} attempts: ${lastResult.error}`);

@@ -252,7 +252,26 @@ export async function runAnalysisPipeline(
   // Step 0: Resolve all branches in parallel
   const resolvedChanges: Array<{ change: ChangeSpec; diff: string; symbols: Symbol[] }> = [];
 
+  // Layer 1 dedup: skip identical (repo, branch) pairs before fetching.
+  // Prevents redundant git fetch calls (up to 60s each) when the caller
+  // submits the same branch twice (e.g. duplicate webhook events).
+  const seenBranches = new Set<string>();
+
+  // Layer 2 dedup: skip identical commit ranges after branch resolution.
+  // Catches cases where two different branch names resolve to the same
+  // base→head range (e.g. a branch that was already merged, or two aliases
+  // pointing at the same tip commit).
+  const seenRanges = new Set<string>();
+
   for (const change of task.changes) {
+    // Layer 1: branch-level dedup
+    const branchKey = changeBranchKey(change);
+    if (seenBranches.has(branchKey)) {
+      console.log(`[pipeline:${task.taskId}] Step 0: Skipping duplicate branch entry: ${change.repo} ${change.branch ?? change.commit ?? ''}`);
+      continue;
+    }
+    seenBranches.add(branchKey);
+
     // Resolve branch
     if (change.branch && !change.commit) {
       console.log(`[pipeline:${task.taskId}] Step 0: Resolving branch ${change.branch} for ${change.repo}`);
@@ -270,6 +289,14 @@ export async function runAnalysisPipeline(
         continue;
       }
     }
+
+    // Layer 2: commit-range-level dedup (catches different branch names → same commits)
+    const rangeKey = changeRangeKey(change);
+    if (seenRanges.has(rangeKey)) {
+      console.log(`[pipeline:${task.taskId}] Step 0: Skipping duplicate commit range: ${change.repo} ${(change.base ?? '').slice(0, 10)}→${(change.commit ?? '').slice(0, 10)}`);
+      continue;
+    }
+    seenRanges.add(rangeKey);
 
     // Get diff
     const diff = getDiff(repoManager, change, config.excludeDirs);
@@ -508,7 +535,7 @@ export async function runAnalysisPipeline(
     baseUrl: config.llm.baseUrl,
     cwd: config.workspaceDir,
     timeoutMs: quickMode ? 480_000 : 900_000,
-    thinkingLevel: "medium",
+    thinkingLevel: resolveThinkingLevel(quickMode, combinedDiff.length),
     skillPath: config.skillPath,
     fallbackModel: config.llm.fallbackModel,
   };
@@ -526,12 +553,14 @@ export async function runAnalysisPipeline(
   };
 
   const step4Start = Date.now();
-  // Limit parallel workers to avoid OOM: 4 for normal, 2 for large symbol sets.
-  // quickMode: force single worker — see runSingleChange for rationale.
-  const MAX_PARALLEL_WORKERS = quickMode ? 1 : (allSymbols.length > 30 ? 2 : 4);
+  // quickMode: allow up to 3 parallel workers (one per resolved change) to cut wall-clock time.
+  // Normal mode: cap at 4 (or 2 for large symbol sets to avoid OOM).
+  const MAX_PARALLEL_WORKERS = quickMode
+    ? Math.min(resolvedChanges.length, 3)
+    : (allSymbols.length > 30 ? 2 : 4);
   let piResult: Awaited<ReturnType<typeof runPiWorkerWithRetry>>;
 
-  if (!quickMode && allSymbols.length >= 3) {
+  if (allSymbols.length >= 3) {
     const groups = splitSymbolsIntoGroups(allSymbols, MAX_PARALLEL_WORKERS);
     console.log(`[pipeline:${task.taskId}] Step 4: Joint parallel — ${allSymbols.length} symbols → ${groups.length} workers (all see full diff)`);
     const workerPromises = groups.map((group, i) => {
@@ -804,7 +833,7 @@ async function runSingleChange(
       // 72s to write out the final JSON report. Empirically, 300s was too
       // tight — pi finished tool calls but got cut off mid-report.
       timeoutMs: quickMode ? 480_000 : 900_000,
-      thinkingLevel: "medium",
+      thinkingLevel: resolveThinkingLevel(quickMode, diff.length),
       skillPath: config.skillPath,
       fallbackModel: config.llm.fallbackModel,
     };
@@ -826,9 +855,13 @@ async function runSingleChange(
     // quickMode: force single worker — multi-worker mode multiplies wall-clock
     // when LLM throughput is the bottleneck (each worker waits on the same
     // upstream API). Single worker also halves token cost.
-    const MAX_PARALLEL_WORKERS = quickMode ? 1 : (symbols.length > 30 ? 2 : 4);
+    // quickMode: allow parallel workers scaled to symbol count (up to 3).
+    // Normal mode: cap at 4 (or 2 for large symbol sets to avoid OOM).
+    const MAX_PARALLEL_WORKERS = quickMode
+      ? Math.min(3, Math.max(1, Math.ceil(symbols.length / 5)))
+      : (symbols.length > 30 ? 2 : 4);
 
-    if (!quickMode && symbols.length >= 3) {
+    if (symbols.length >= 3) {
       // ─── Parallel mode: split symbols into groups, run workers concurrently ──
       const groups = splitSymbolsIntoGroups(symbols, MAX_PARALLEL_WORKERS);
       console.log(`[pipeline:${task.taskId}] Step 4: Parallel mode — ${symbols.length} symbols → ${groups.length} workers`);
@@ -1354,6 +1387,16 @@ function extractSymbolsFromDiff(diff: string): Symbol[] {
 // ─── Parallel Worker Helpers ──────────────────────────────────────────────────
 
 /**
+ * Resolve thinking level based on mode and diff size.
+ * quickMode + small diff (<3000 chars) → "low" (faster, slightly shallower).
+ * All other cases → "medium".
+ */
+function resolveThinkingLevel(quickMode: boolean, diffSize: number): "low" | "medium" {
+  if (!quickMode) return "medium";
+  return diffSize < 3_000 ? "low" : "medium";
+}
+
+/**
  * Split symbols into groups for parallel workers.
  * Each group gets 1-2 symbols; total groups capped at maxGroups.
  */
@@ -1826,10 +1869,31 @@ function buildDefaultMeta(): Record<string, unknown> {
 }
 
 
+// ─── Dedup key helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Layer 1 dedup key: (repo, branch|commit) — catches identical branch submissions
+ * before any network fetch occurs.
+ */
+function changeBranchKey(change: ChangeSpec): string {
+  return `${change.repo}::${change.branch ?? change.commit ?? ''}`;
+}
+
+/**
+ * Layer 2 dedup key: (repo, base, commit) — catches different branch names that
+ * resolve to the same commit range after git fetch + merge-base resolution.
+ * Only meaningful after change.commit and change.base are populated.
+ */
+function changeRangeKey(change: ChangeSpec): string {
+  return `${change.repo}::${change.base ?? ''}::${change.commit ?? ''}`;
+}
+
 // ─── Test exports ─────────────────────────────────────────────────────────────
 // These helpers are exported for unit testing. Not part of the public API.
 export {
   mergeAnalysisJsons as __mergeAnalysisJsonsForTest,
   symbolDedupKey as __symbolDedupKeyForTest,
   pickBetterName as __pickBetterNameForTest,
+  changeBranchKey as __changeBranchKeyForTest,
+  changeRangeKey as __changeRangeKeyForTest,
 };
