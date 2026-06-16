@@ -168,6 +168,18 @@ export async function runPiWorker(
 
   console.log(`[pi:rpc] Starting pi --mode rpc, prompt size: ${fullPrompt.length} chars, cwd: ${config.cwd}`);
 
+  // Write a minimal MCP config to pass via --mcp-config.
+  // NOTE: In pi ≥ 0.79, --mcp-config overrides ~/.pi/agent/mcp.json so the
+  // context-mode MCP server is bypassed for RPC workers. In older versions this
+  // did not fully override the agent-level config. The real fix is upgrading pi
+  // in the Dockerfile. This file is still written as a belt-and-suspenders guard.
+  const emptyMcpPath = "/tmp/pi-rpc-empty-mcp.json";
+  try {
+    fs.writeFileSync(emptyMcpPath, JSON.stringify({ mcpServers: {} }), "utf-8");
+  } catch {
+    // Non-fatal: if we can't write, omit the flag and let pi use its default config
+  }
+
   const args = [
     "--mode", "rpc",
     "--provider", config.provider,
@@ -175,7 +187,13 @@ export async function runPiWorker(
     "--api-key", config.apiKey,
     "--no-session",
     "--tools", "read,grep,find,bash", // restrict to read-only tools for safety
+    "--no-lens",                       // skip LSP server startup (not needed for analysis)
   ];
+
+  // Override MCP config with empty file to bypass context-mode startup delay
+  if (fs.existsSync(emptyMcpPath)) {
+    args.push("--mcp-config", emptyMcpPath);
+  }
 
   // Add thinking level if specified
   if (config.thinkingLevel && config.thinkingLevel !== "off") {
@@ -227,6 +245,28 @@ export async function runPiWorker(
       proc.stdin?.write(promptCommand + "\n");
       console.log(`[pi:rpc] Sent prompt command via stdin (${promptCommand.length} chars)`);
     };
+
+    // Session watchdog: if pi doesn't emit "session" within 10s after the last
+    // extension_ui_request was acked, send the prompt anyway. In pi 0.79.x,
+    // bindExtensions() → emit(session_start) can block for minutes inside
+    // extension handlers, but pi still reads stdin and queues commands — so
+    // sending the prompt early is safe and avoids the 45s kill-and-retry cycle.
+    // The watchdog is reset every time an extension_ui_request is acked.
+    let sessionWatchdogHandle: ReturnType<typeof setTimeout> | null = null;
+    const SESSION_PROMPT_DELAY_MS = 2_000; // 2s after last ack → send prompt
+    const armSessionWatchdog = () => {
+      if (sessionWatchdogHandle) clearTimeout(sessionWatchdogHandle);
+      sessionWatchdogHandle = setTimeout(() => {
+        sessionWatchdogHandle = null;
+        if (!promptSent) {
+          const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+          console.log(`[pi:session-watchdog +${elapsed}s] No session after ${SESSION_PROMPT_DELAY_MS / 1000}s — sending prompt early (pi 0.79.x queues cmds before session)`);
+          sendPrompt();
+        }
+      }, SESSION_PROMPT_DELAY_MS);
+    };
+    // Arm immediately so a prompt is sent even if no extension_ui_request fires
+    armSessionWatchdog();
 
     // Steer timer: send "wrap up" message before timeout to ensure pi outputs final report
     const steerDelayMs = Math.max(timeoutMs - 100_000, timeoutMs * 0.85); // 100s before timeout, or 85% of timeout
@@ -447,6 +487,24 @@ export async function runPiWorker(
             console.log(`[pi:event +${elapsed}s] FATAL: ${event.message ?? JSON.stringify(event)}`);
             break;
 
+          case "extension_ui_request":
+            // Pi-subagents and other extensions register TUI widgets. In RPC mode pi
+            // emits these as `extension_ui_request` and waits for an
+            // `extension_ui_response` before proceeding (including before emitting
+            // the `session` event). Without a response the session init stalls
+            // indefinitely. Send an empty ack so pi can continue.
+            // Also re-arm the session watchdog: after the last ack + 2s of silence,
+            // the prompt will be sent automatically (pi 0.79.x queues commands).
+            if (event.id) {
+              try {
+                proc.stdin?.write(
+                  JSON.stringify({ type: "extension_ui_response", id: event.id }) + "\n",
+                );
+              } catch {}
+              armSessionWatchdog();
+            }
+            break;
+
           default:
             // Don't log every text_delta, message_update etc to avoid noise
             break;
@@ -474,6 +532,7 @@ export async function runPiWorker(
     const cleanup = () => {
       clearTimeout(timeoutHandle);
       clearTimeout(steerTimer);
+      if (sessionWatchdogHandle) { clearTimeout(sessionWatchdogHandle); sessionWatchdogHandle = null; }
       if (killTimer) clearTimeout(killTimer);
       clearInterval(watchdog);
       try { rl.close(); } catch {}
@@ -517,9 +576,13 @@ export async function runPiWorker(
       const durationMs = Date.now() - startTime;
       console.log(`[pi:exit] code=${code}, duration=${(durationMs / 1000).toFixed(1)}s, output=${textOutput.length} chars, turns=${turnCount}, toolCalls=${toolCallCount}`);
 
-      if (code === 0 || textOutput.length > 0) {
+      if (code === 0) {
         resolve({ success: true, output: textOutput, durationMs, usage, toolCallCount, turnCount, toolEvents });
       } else {
+        // Non-zero exit is always a failure, even if partial text was produced.
+        // Previously `textOutput.length > 0` was treated as success, which caused
+        // the retry loop to skip retries when the agent crashed mid-turn after
+        // writing a few lines (e.g. Step 0 context check) but before producing JSON.
         resolve({
           success: false,
           output: textOutput,
@@ -548,13 +611,6 @@ export async function runPiWorker(
       });
     });
 
-    // Fallback: if pi doesn't emit "session" event within 3s, send prompt anyway
-    setTimeout(() => {
-      if (!promptSent) {
-        console.log(`[pi:rpc] No session event after 3s, sending prompt as fallback`);
-        sendPrompt();
-      }
-    }, 3000);
   });
 }
 
@@ -790,9 +846,18 @@ ${params.globalPatterns}
 /**
  * Extract JSON result from pi agent's text output.
  * Looks for ```json ... ``` blocks.
+ *
+ * Truncation recovery: when the agent is SIGKILL'd mid-stream (timeout race,
+ * EP-004), the output ends inside a ```json block without a closing ```.
+ * In that case we attempt a best-effort repair:
+ *   1. Find the last ```json opener with no matching closer.
+ *   2. Trim the fragment to the last complete top-level object boundary.
+ *   3. Walk the open-bracket stack and append the missing closers.
+ * This lets us salvage a partial-but-mostly-complete report instead of
+ * falling back to the all-empty buildFallbackArtifact skeleton.
  */
 export function extractJsonFromOutput(output: string): Record<string, unknown> | null {
-  // Match the last ```json ... ``` block (final report)
+  // ── Pass 1: find the last complete ```json ... ``` block ──────────────────
   const jsonBlocks = output.matchAll(/```json\s*\n([\s\S]*?)\n```/g);
   let lastBlock: string | null = null;
 
@@ -800,13 +865,149 @@ export function extractJsonFromOutput(output: string): Record<string, unknown> |
     lastBlock = match[1];
   }
 
-  if (!lastBlock) return null;
-
-  try {
-    return JSON.parse(lastBlock);
-  } catch {
-    return null;
+  if (lastBlock) {
+    try {
+      return JSON.parse(lastBlock);
+    } catch {
+      return null;
+    }
   }
+
+  // ── Pass 2: truncation recovery — find an unclosed ```json block ──────────
+  const openIdx = output.lastIndexOf("```json");
+  if (openIdx !== -1) {
+    // Extract everything after the ```json\n opener
+    const afterMarker = output.slice(openIdx + 7); // len("```json") === 7
+    const newlineIdx = afterMarker.indexOf("\n");
+    if (newlineIdx !== -1) {
+      const fragment = afterMarker.slice(newlineIdx + 1);
+
+      // Only attempt repair when there is no closing ``` (i.e. output is truncated)
+      if (!fragment.includes("\n```")) {
+        const repaired = repairTruncatedJson(fragment);
+        if (repaired) {
+          try {
+            const parsed = JSON.parse(repaired);
+            if (typeof parsed === "object" && parsed !== null) {
+              // Tag the result so callers know it was recovered from a truncated stream
+              (parsed as Record<string, unknown>)._truncated = true;
+              console.warn(`[extractJson] Recovered truncated JSON (${fragment.length} → ${repaired.length} chars)`);
+              return parsed as Record<string, unknown>;
+            }
+          } catch {
+            // fall through to Pass 3
+          }
+        }
+      }
+    }
+  }
+
+  // ── Pass 3: bare JSON object — pi may output JSON without ```json wrapper ──
+  // pi 0.79.x sometimes emits the final report as a bare JSON object rather
+  // than wrapping it in a ```json ... ``` markdown block.
+  // Look for the last occurrence of {"schema_version" in the output and attempt
+  // to parse the JSON object starting there.
+  const schemaVersionMarker = '"schema_version"';
+  let bareJsonIdx = output.lastIndexOf(schemaVersionMarker);
+  if (bareJsonIdx !== -1) {
+    // Walk backward to find the opening `{` of the top-level object
+    let braceIdx = output.lastIndexOf("{", bareJsonIdx);
+    if (braceIdx !== -1) {
+      const candidate = output.slice(braceIdx);
+      try {
+        const parsed = JSON.parse(candidate);
+        if (typeof parsed === "object" && parsed !== null) {
+          console.warn(`[extractJson] Extracted bare JSON object at index ${braceIdx} (${candidate.length} chars)`);
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // JSON is incomplete — try truncation repair
+        const repaired = repairTruncatedJson(candidate);
+        if (repaired) {
+          try {
+            const parsed = JSON.parse(repaired);
+            if (typeof parsed === "object" && parsed !== null) {
+              (parsed as Record<string, unknown>)._truncated = true;
+              console.warn(`[extractJson] Recovered bare truncated JSON (${candidate.length} → ${repaired.length} chars)`);
+              return parsed as Record<string, unknown>;
+            }
+          } catch {
+            // unrecoverable
+          }
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Best-effort repair of a JSON fragment that was cut off mid-stream.
+ *
+ * Strategy:
+ *   1. Walk the fragment to find the last "safe" truncation point — the
+ *      position after the last complete top-level value (depth ≤ 1 after
+ *      a `}` or `]`, or before a trailing `,` at depth ≤ 2).
+ *   2. Re-walk only the safe prefix to rebuild the exact open-bracket stack
+ *      at that point.
+ *   3. Append the missing closers in reverse order.
+ *
+ * Returns null when the fragment is too malformed to recover (e.g. cut
+ * inside a string literal — detected via unclosed quote tracking).
+ */
+function repairTruncatedJson(fragment: string): string | null {
+  if (!fragment.trim().startsWith("{")) return null;
+
+  // ── Pass 1: find the deepest safe truncation index ────────────────────────
+  let inString = false;
+  let escape = false;
+  let depth = 0;
+  let lastSafeEnd = -1;
+
+  for (let i = 0; i < fragment.length; i++) {
+    const ch = fragment[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\" && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (ch === "{" || ch === "[") {
+      depth++;
+    } else if (ch === "}" || ch === "]") {
+      depth--;
+      if (depth <= 1) lastSafeEnd = i + 1; // complete element just closed
+    } else if (ch === "," && depth <= 2) {
+      lastSafeEnd = i; // exclude trailing comma
+    }
+  }
+
+  // Truncated inside a string literal — cannot recover
+  if (inString) return null;
+
+  // ── Pass 2: re-walk the safe prefix to get the exact bracket stack ────────
+  const safePrefix = lastSafeEnd > 0 ? fragment.slice(0, lastSafeEnd) : fragment.trimEnd();
+
+  inString = false;
+  escape = false;
+  const stack: string[] = [];
+
+  for (let i = 0; i < safePrefix.length; i++) {
+    const ch = safePrefix[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\" && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (ch === "{" || ch === "[") {
+      stack.push(ch === "{" ? "}" : "]");
+    } else if (ch === "}" || ch === "]") {
+      stack.pop();
+    }
+  }
+
+  const closers = stack.slice().reverse().join("");
+  return safePrefix + closers;
 }
 
 /**
@@ -836,16 +1037,28 @@ export async function runPiWorkerWithRetry(
 
     lastResult = await runPiWorker(prompt, currentConfig, signal);
 
-    // Success — return immediately
-    if (lastResult.success) {
+    // Success with JSON output — return immediately
+    const hasJson = lastResult.output.includes("```json");
+    if (lastResult.success && hasJson) {
       if (attempt > 1) {
         console.log(`[pi:retry] Succeeded on attempt ${attempt}${currentConfig.model !== config.model ? ` (fallback model: ${currentConfig.model})` : ""}`);
       }
       return lastResult;
     }
 
-    // Timeout — don't retry, return partial result
-    const isTimeout = lastResult.error?.includes("timeout") || (lastResult.durationMs >= (config.timeoutMs ?? 600_000) * 0.95);
+    // Agent exited cleanly (code=0) but produced no JSON block — treat as
+    // retryable failure. This happens when the agent crashes mid-turn after
+    // writing prose (e.g. "Step 0 complete") but before emitting the report.
+    if (lastResult.success && !hasJson) {
+      console.log(`[pi:retry] Agent succeeded but no JSON block in output (${lastResult.output.length} chars), treating as retryable failure`);
+      lastResult = { ...lastResult, success: false, error: "no JSON block in output" };
+    }
+
+    // Timeout — don't retry, return partial result.
+    // Only treat as non-retryable timeout when the worker actually ran for
+    // close to the full timeoutMs budget (≥95%). A "session init stall" that
+    // resolves in 45s must NOT be treated as a timeout — it should retry.
+    const isTimeout = (lastResult.durationMs >= (config.timeoutMs ?? 600_000) * 0.95);
     if (isTimeout) {
       console.log(`[pi:retry] Timeout on attempt ${attempt}, returning partial result`);
       return lastResult;

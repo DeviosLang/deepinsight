@@ -314,7 +314,7 @@ export async function runAnalysisPipeline(
       ? `=== Commit Log ===\n${commitMessages}\n\n=== Code Diff ===\n${diff}`
       : diff;
 
-    // Extract symbols
+    // Extract symbols (always from the original diff, not the summary)
     const symbols = extractSymbolsFromDiff(diff);
     console.log(`[pipeline:${task.taskId}] ${change.repo}: diff ${diff.length} chars, ${symbols.length} symbols: ${symbols.map(s => s.name).join(', ')}`);
     resolvedChanges.push({ change, diff: diffWithContext, symbols });
@@ -323,6 +323,23 @@ export async function runAnalysisPipeline(
   if (resolvedChanges.length === 0) {
     task.error = "所有仓库的 diff 均为空";
     return null;
+  }
+
+  // quickMode: summarize large diffs before combining.
+  // A single repo with 400KB+ diff pushes the joint prompt past ~120K tokens,
+  // causing pi workers to time out before producing the JSON report. The summary
+  // preserves all symbol-level semantic information needed for impact analysis
+  // at a fraction of the token cost. Normal mode uses the full diff for depth.
+  const quickMode = task.options?.quickMode === true;
+  if (quickMode) {
+    await Promise.all(resolvedChanges.map(async (rc) => {
+      if (rc.diff.length > DIFF_SUMMARY_THRESHOLD_BYTES) {
+        console.log(
+          `[pipeline:${task.taskId}] quickMode: diff for ${rc.change.repo} is ${rc.diff.length} chars — summarizing`,
+        );
+        rc.diff = await summarizeDiff(rc.diff, rc.change.repo, config.llm, task.taskId);
+      }
+    }));
   }
 
   // Combine all symbols
@@ -428,8 +445,6 @@ export async function runAnalysisPipeline(
   const changedRepos = new Set(resolvedChanges.map((rc) => rc.change.repo));
   const targetRepos = allRepos.filter((r) => !changedRepos.has(r));
 
-  const quickMode = task.options?.quickMode === true;
-
   // Coarse filter with combined symbols
   console.log(`[pipeline:${task.taskId}] Step 3: Joint coarse filter, ${allSymbols.length} symbols across ${targetRepos.length} repos...`);
   const coarseHits = await coarseFilter(allSymbols, targetRepos, repoManager);
@@ -534,7 +549,7 @@ export async function runAnalysisPipeline(
     apiKey: config.llm.apiKey,
     baseUrl: config.llm.baseUrl,
     cwd: config.workspaceDir,
-    timeoutMs: quickMode ? 480_000 : 900_000,
+    timeoutMs: 900_000,
     thinkingLevel: resolveThinkingLevel(quickMode, combinedDiff.length),
     skillPath: config.skillPath,
     fallbackModel: config.llm.fallbackModel,
@@ -832,7 +847,7 @@ async function runSingleChange(
       // fires at ~85% of timeout (≈ 408s for 480s), leaving the remaining
       // 72s to write out the final JSON report. Empirically, 300s was too
       // tight — pi finished tool calls but got cut off mid-report.
-      timeoutMs: quickMode ? 480_000 : 900_000,
+      timeoutMs: 900_000,
       thinkingLevel: resolveThinkingLevel(quickMode, diff.length),
       skillPath: config.skillPath,
       fallbackModel: config.llm.fallbackModel,
@@ -1382,6 +1397,110 @@ function extractSymbolsFromDiff(diff: string): Symbol[] {
     !s.name.startsWith("Test") &&
     !GENERIC_NAMES.has(s.name)
   );
+}
+
+// ─── Diff Summarization ───────────────────────────────────────────────────────
+
+/**
+ * Threshold above which a diff is considered "large" in quickMode.
+ * 50 KB ≈ 12-15K tokens — manageable alone, but combined with SKILL.md and
+ * other repos it can push the total prompt past 100K tokens and cause the
+ * pi worker to time out before producing the final JSON report.
+ */
+const DIFF_SUMMARY_THRESHOLD_BYTES = 50_000;
+
+/**
+ * Summarize a large diff into a compact structured description so the analysis
+ * prompt stays within a token budget the pi worker can finish in time.
+ *
+ * Only called in quickMode when a single-repo diff exceeds
+ * DIFF_SUMMARY_THRESHOLD_BYTES. Normal (non-quick) mode always uses the full
+ * diff so the agent has maximum context for deep analysis.
+ *
+ * The summary preserves all information needed for cross-repo impact analysis:
+ *   • every changed symbol (function / class / method name)
+ *   • what changed at the logic level (not line-by-line)
+ *   • parameter / return-type / schema changes
+ *   • new or removed dependencies / callee changes
+ *
+ * Output is compact structured text (~2-5 KB), replacing the raw diff in the
+ * analysis prompt. The original diff is still used for symbol extraction
+ * (extractSymbolsFromDiff) before this function is called.
+ */
+export async function summarizeDiff(
+  diff: string,
+  repoName: string,
+  llm: { apiKey: string; baseUrl: string; model: string },
+  taskId: string,
+): Promise<string> {
+  const prompt = `你是一个代码审查专家。请将以下 git diff 压缩为结构化的符号变更摘要。
+
+要求：
+1. 列出每个变更的函数/类/方法，格式如下：
+   [符号名] (文件路径:起始行)
+     - 变更类型：modified / added / deleted
+     - 核心变更：<一句话描述逻辑变化>
+     - 参数变化：<如有，列出入参/返回值的增删改>
+     - 调用依赖变化：<如有，列出新增/删除的被调用函数或外部依赖>
+
+2. 保留对跨仓影响分析关键的所有语义信息
+3. 省略纯格式变化（空行、注释格式、import 排序等）
+4. 如果变更涉及数据结构/schema，必须说明字段的增删改
+5. 总长度不超过 4000 字
+
+仓库：${repoName}
+原始 diff 大小：${diff.length} 字节
+
+=== Diff 内容 ===
+${diff}
+
+请直接输出摘要，不要输出其他内容。`;
+
+  const t0 = Date.now();
+  try {
+    const response = await fetch(`${llm.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${llm.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: llm.model,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 2000,
+        temperature: 0,
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      console.warn(`[pipeline:${taskId}] summarizeDiff HTTP ${response.status} for ${repoName}: ${body.slice(0, 200)}`);
+      return diff; // fall back to original diff
+    }
+
+    const data = await response.json() as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const summary = data.choices?.[0]?.message?.content?.trim() ?? "";
+
+    if (!summary) {
+      console.warn(`[pipeline:${taskId}] summarizeDiff empty response for ${repoName}, using original`);
+      return diff;
+    }
+
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.log(
+      `[pipeline:${taskId}] summarizeDiff: ${repoName} ${diff.length} → ${summary.length} chars (${elapsed}s)`,
+    );
+    return `=== 变更摘要（原始 diff ${diff.length} 字节，已压缩）===\n${summary}`;
+  } catch (err) {
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+    console.warn(
+      `[pipeline:${taskId}] summarizeDiff failed for ${repoName} (${elapsed}s): ${err instanceof Error ? err.message : String(err)}, using original diff`,
+    );
+    return diff; // always fall back gracefully
+  }
 }
 
 // ─── Parallel Worker Helpers ──────────────────────────────────────────────────
