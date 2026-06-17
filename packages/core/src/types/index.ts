@@ -310,6 +310,12 @@ export interface AnalysisTask {
   status: TaskStatus;
   changes: ChangeSpec[];
   options: AnalysisOptions;
+  /**
+   * Stable dedup key computed at submission time from (project, changes, options).
+   * Used by the POST /analyze idempotency check to detect duplicate requests.
+   * Optional — absent on tasks persisted before this field was introduced.
+   */
+  dedupKey?: string;
   progress?: TaskProgress;
   /**
    * Output payload. Typed loosely as `unknown` because the runtime can

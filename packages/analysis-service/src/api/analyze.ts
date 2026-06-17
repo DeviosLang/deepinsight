@@ -333,6 +333,72 @@ interface AnalyzeBody {
   options?: AnalysisOptions;
 }
 
+/**
+ * Compute a stable dedup key for a request.
+ *
+ * Key is scoped to (project, sorted changes, options) so that two POST
+ * requests with identical intent map to the same string regardless of
+ * array ordering. Used by the request-level idempotency check in the
+ * POST /analyze handler.
+ */
+function requestDedupKey(project: string, changes: ChangeSpec[], options: AnalysisOptions): string {
+  const changeKey = changes
+    .map((c) => `${c.repo}::${c.branch ?? ""}::${c.commit ?? ""}::${c.base ?? ""}`)
+    .sort()
+    .join("|");
+  // Stable JSON: sort keys so insertion order doesn't affect the key.
+  const optKey = JSON.stringify(
+    Object.fromEntries(Object.entries(options).sort(([a], [b]) => a.localeCompare(b))),
+  );
+  return `${project}||${changeKey}||${optKey}`;
+}
+
+/** TTL for reusing a completed task. Requests arriving within this window
+ *  for the same (project, changes, options) get the existing taskId back
+ *  instead of triggering a fresh analysis. Set to 24 h. */
+const COMPLETED_TASK_REUSE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Find an existing task that covers the same request.
+ *
+ * Returns the most-recent matching task when:
+ *   - status is queued or running (always reusable — share the in-flight work), or
+ *   - status is completed and the result is less than COMPLETED_TASK_REUSE_TTL_MS old.
+ *
+ * Failed tasks are never reused — the caller should be able to retry.
+ *
+ * Searches only the in-memory Map (≤ 200 entries, O(n) acceptable).
+ * Cross-Pod dedup is left for a future iteration — it would require an
+ * NFS scan on every POST which is unacceptable on the hot path.
+ */
+function findExistingTask(key: string): AnalysisTask | null {
+  let best: AnalysisTask | null = null;
+  const now = Date.now();
+
+  for (const task of tasks.values()) {
+    if (task.dedupKey !== key) continue;
+    if (task.status === "failed") continue;
+
+    if (task.status === "queued" || task.status === "running") {
+      // In-flight tasks are always reusable; prefer the most recent one.
+      if (!best || new Date(task.createdAt).getTime() > new Date(best.createdAt).getTime()) {
+        best = task;
+      }
+      continue;
+    }
+
+    // status === "completed"
+    const age = now - new Date(task.completedAt!).getTime();
+    if (age <= COMPLETED_TASK_REUSE_TTL_MS) {
+      if (!best || new Date(task.createdAt).getTime() > new Date(best.createdAt).getTime()) {
+        best = task;
+      }
+    }
+  }
+
+  return best;
+}
+
 export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
   const pipelineConfig = loadPipelineConfig();
 
@@ -346,6 +412,24 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
 
     // Normalize repo fields: accept full HTTP(S) URLs as well as bare names.
     const normalizedChanges = changes.map((c) => ({ ...c, repo: normalizeRepo(c.repo) }));
+    const normalizedOptions = options ?? {};
+
+    // ── Request-level idempotency ───────────────────────────────────────────
+    // If a task with the same (project, changes, options) is already queued,
+    // running, or recently completed (< 24 h), return its taskId directly.
+    // This prevents duplicate analysis runs for the same branch push event
+    // and lets CI pipelines safely re-POST without burning extra LLM quota.
+    const dedupKey = requestDedupKey(project, normalizedChanges, normalizedOptions);
+    const existing = findExistingTask(dedupKey);
+    if (existing) {
+      reply.header("X-Pod-Name", POD_NAME);
+      return reply.status(200).send({
+        taskId: existing.taskId,
+        status: existing.status,
+        pollUrl: `/api/analyze/${existing.taskId}`,
+        reused: true,
+      });
+    }
 
     const taskId = `analysis-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -354,7 +438,8 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
       project,
       status: "queued",
       changes: normalizedChanges,
-      options: options ?? {},
+      options: normalizedOptions,
+      dedupKey,
       createdAt: new Date().toISOString(),
     };
 
