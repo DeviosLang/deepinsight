@@ -288,6 +288,13 @@ export async function runAnalysisPipeline(
         console.warn(`[pipeline:${task.taskId}] Failed to fetch ${change.branch} for ${change.repo}, skipping`);
         continue;
       }
+    } else if (change.commit && !change.branch) {
+      // Bare commit (no branch): sync job may not have the objects. Best-effort
+      // full fetch; on failure getDiff will report the precise git error.
+      console.log(`[pipeline:${task.taskId}] Step 0: commit provided without branch, fetching origin for ${change.repo}`);
+      if (!repoManager.fetchOrigin(change.repo)) {
+        console.warn(`[pipeline:${task.taskId}] Step 0: fetch origin failed for ${change.repo}, will attempt diff anyway`);
+      }
     }
 
     // Layer 2: commit-range-level dedup (catches different branch names → same commits)
@@ -299,9 +306,9 @@ export async function runAnalysisPipeline(
     seenRanges.add(rangeKey);
 
     // Get diff
-    const diff = getDiff(repoManager, change, config.excludeDirs);
+    const { diff, error: diffError } = getDiff(repoManager, change, config.excludeDirs);
     if (!diff) {
-      console.warn(`[pipeline:${task.taskId}] No diff for ${change.repo}, skipping`);
+      console.warn(`[pipeline:${task.taskId}] No diff for ${change.repo}, skipping${diffError ? `: ${diffError}` : ""}`);
       continue;
     }
 
@@ -672,6 +679,17 @@ async function runSingleChange(
       task.error = `无法 fetch 分支 ${change.branch}（仓库: ${change.repo}）`;
       return { result: null, piResult: null };
     }
+  } else if (change.commit && !change.branch) {
+    // Caller supplied a bare commit (+ optional base) with no branch name.
+    // The periodic sync job only guarantees objects for the default branch's
+    // history, so a feature-branch commit may be absent from the local object
+    // store. Fetch origin as a best-effort fallback; on failure we still
+    // proceed — getDiff will surface the precise git error to task.error.
+    console.log(`[pipeline:${task.taskId}] Step 0: commit provided without branch, fetching origin for ${change.repo}`);
+    const fetched = repoManager.fetchOrigin(change.repo);
+    if (!fetched) {
+      console.warn(`[pipeline:${task.taskId}] Step 0: fetch origin failed for ${change.repo}, will attempt diff anyway`);
+    }
   }
 
   // ─── Step 1: Get diff ────────────────────────────────────────────────────────
@@ -679,9 +697,11 @@ async function runSingleChange(
   console.log(`[pipeline:${task.taskId}] Step 1: Getting diff for ${change.repo} (${change.base} → ${change.commit ?? 'HEAD'})`);
 
   const step1Start = Date.now();
-  const diff = getDiff(repoManager, change, config.excludeDirs);
+  const { diff, error: diffError } = getDiff(repoManager, change, config.excludeDirs);
   if (!diff) {
-    task.error = `无法获取 ${change.repo} 的 diff`;
+    // Surface the underlying git error (e.g. "fatal: bad revision 8886306...")
+    // so triage doesn't require pod access to read [git diff] warn logs.
+    task.error = `无法获取 ${change.repo} 的 diff${diffError ? `（${diffError}）` : ""}`;
     return { result: null, piResult: null };
   }
   recordSpan(traceCtx, "step1_getDiff", step1Start, {
@@ -1328,20 +1348,26 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
-function getDiff(repoManager: RepoManager, change: ChangeSpec, excludeDirs?: string[]): string | null {
-  if (!repoManager.repoExists(change.repo)) return null;
+function getDiff(
+  repoManager: RepoManager,
+  change: ChangeSpec,
+  excludeDirs?: string[],
+): { diff: string | null; error?: string } {
+  if (!repoManager.repoExists(change.repo)) {
+    return { diff: null, error: `仓库 ${change.repo} 不存在于 workspace` };
+  }
 
   const base = change.base ?? "HEAD~1";
   const head = change.commit ?? "HEAD";
 
   if (excludeDirs && excludeDirs.length > 0) {
     // Use git diff with pathspec exclusions: -- ':!tests/' ':!test/'
-    const diff = repoManager.getDiffWithExcludes(change.repo, base, head, excludeDirs);
-    return diff || null;
+    const { diff, error } = repoManager.getDiffWithExcludes(change.repo, base, head, excludeDirs);
+    return { diff: diff || null, error };
   }
 
-  const diff = repoManager.getDiff(change.repo, base, head);
-  return diff || null;
+  const { diff, error } = repoManager.getDiff(change.repo, base, head);
+  return { diff: diff || null, error };
 }
 
 /**

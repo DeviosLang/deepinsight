@@ -14,6 +14,14 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RepoConfig } from "@deepinsight/core";
 
+/** Structured git-diff result. `diff` is the raw patch (empty on failure).
+ *  `error` carries the git stderr/exit info so callers can surface a useful
+ *  message instead of a generic "could not get diff". */
+export interface DiffResult {
+  diff: string;
+  error?: string;
+}
+
 export interface RepoManagerConfig {
   /** Base directory for repo data (NFS mount with full clones) */
   workspaceDir: string;
@@ -171,6 +179,35 @@ export class RepoManager {
   }
 
   /**
+   * Fetch all branches/tags from origin (with prune).
+   *
+   * Used as a fallback in Step 0 when a caller supplies a bare `commit`+`base`
+   * (no branch name) — the periodic sync job only guarantees objects for the
+   * default branch's history, so a feature-branch commit may be absent until
+   * we fetch. Best-effort: callers continue on failure and let `getDiff`
+   * report the precise git error.
+   */
+  fetchOrigin(repoName: string): boolean {
+    const repoPath = this.getRepoPath(repoName);
+    console.log(`[git fetch] ${repoName}: fetching origin --prune`);
+    const result = spawnSync("git", ["fetch", "origin", "--prune"], {
+      cwd: repoPath,
+      timeout: 120_000,
+      encoding: "utf-8",
+    });
+    if (result.error) {
+      console.warn(`[git fetch] ${repoName}: spawn error: ${result.error.message}`);
+      return false;
+    }
+    if (result.status !== 0) {
+      const stderr = result.stderr?.trim();
+      console.warn(`[git fetch] ${repoName}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Fetch a specific branch from remote origin.
    * Returns true if fetch succeeded.
    */
@@ -250,8 +287,12 @@ export class RepoManager {
   /**
    * Get diff between two refs, excluding specified directories.
    * Uses git pathspec exclusion syntax: ':!path/'
+   *
+   * Returns a DiffResult so callers can distinguish a real failure (bad ref,
+   * repo corruption, timeout) from an empty diff — both yield an empty stdout,
+   * but only the former sets `error`.
    */
-  getDiffWithExcludes(repoName: string, base = "HEAD~1", head = "HEAD", excludeDirs: string[]): string {
+  getDiffWithExcludes(repoName: string, base = "HEAD~1", head = "HEAD", excludeDirs: string[]): DiffResult {
     const repoPath = this.getRepoPath(repoName);
     const args = ["diff", base, head, "--"];
 
@@ -266,23 +307,26 @@ export class RepoManager {
       encoding: "utf-8",
     });
     if (result.error) {
-      console.warn(`[git diff] ${repoName}: spawn error: ${result.error.message}`);
-      return "";
+      const msg = `spawn error: ${result.error.message}`;
+      console.warn(`[git diff] ${repoName}: ${msg}`);
+      return { diff: "", error: msg };
     }
     if (result.status !== 0) {
       // Distinguish a real failure (bad ref, repo corruption, timeout) from
       // an empty diff (status 0). Without this an unknown ref silently
       // returns "" and the pipeline reports "no symbols changed".
       const stderr = result.stderr?.trim();
-      console.warn(`[git diff] ${repoName} ${base}..${head}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+      const msg = `exit ${result.status}${stderr ? `: ${stderr}` : ""}`;
+      console.warn(`[git diff] ${repoName} ${base}..${head}: ${msg}`);
+      return { diff: "", error: msg };
     }
-    return result.stdout ?? "";
+    return { diff: result.stdout ?? "" };
   }
 
   /**
    * Get diff between two refs (or working tree changes).
    */
-  getDiff(repoName: string, base = "HEAD~1", head = "HEAD"): string {
+  getDiff(repoName: string, base = "HEAD~1", head = "HEAD"): DiffResult {
     const repoPath = this.getRepoPath(repoName);
     const result = spawnSync("git", ["diff", base, head], {
       cwd: repoPath,
@@ -290,14 +334,17 @@ export class RepoManager {
       encoding: "utf-8",
     });
     if (result.error) {
-      console.warn(`[git diff] ${repoName}: spawn error: ${result.error.message}`);
-      return "";
+      const msg = `spawn error: ${result.error.message}`;
+      console.warn(`[git diff] ${repoName}: ${msg}`);
+      return { diff: "", error: msg };
     }
     if (result.status !== 0) {
       const stderr = result.stderr?.trim();
-      console.warn(`[git diff] ${repoName} ${base}..${head}: exit ${result.status}${stderr ? `: ${stderr}` : ""}`);
+      const msg = `exit ${result.status}${stderr ? `: ${stderr}` : ""}`;
+      console.warn(`[git diff] ${repoName} ${base}..${head}: ${msg}`);
+      return { diff: "", error: msg };
     }
-    return result.stdout ?? "";
+    return { diff: result.stdout ?? "" };
   }
 
   /**

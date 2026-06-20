@@ -36,17 +36,46 @@ spec:
                     repo_name=$(basename "$repo_dir")
                     echo -n "[repo-sync] Fetching $repo_name... "
 
-                    if git -C "$repo_dir" fetch origin --prune --quiet 2>/dev/null; then
-                      # Fast-forward current branch to origin (never gc old commits)
-                      git -C "$repo_dir" config gc.auto 0
-                      current_branch=$(git -C "$repo_dir" branch --show-current 2>/dev/null)
-                      if [ -n "$current_branch" ]; then
-                        git -C "$repo_dir" reset --hard "origin/$current_branch" --quiet 2>/dev/null
+                    if ! git -C "$repo_dir" fetch origin --prune --quiet 2>/dev/null; then
+                      echo "FETCH-FAILED"
+                      FAIL=$((FAIL + 1))
+                      continue
+                    fi
+
+                    # Never follow whatever branch a human left checked out in
+                    # the worktree (e.g. a debug feature branch) — always sync
+                    # the canonical default branch so indexer/agents-md refresh
+                    # sees a stable tree, and so feature-branch commits don't
+                    # strand the worktree on a stale ref.
+                    git -C "$repo_dir" config gc.auto 0
+                    default_branch=$(git -C "$repo_dir" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
+                    if [ -z "$default_branch" ]; then
+                      if git -C "$repo_dir" rev-parse --verify --quiet origin/master >/dev/null 2>&1; then
+                        default_branch=master
+                      elif git -C "$repo_dir" rev-parse --verify --quiet origin/main >/dev/null 2>&1; then
+                        default_branch=main
                       fi
-                      echo "OK"
+                    fi
+
+                    if [ -z "$default_branch" ]; then
+                      echo "NO-DEFAULT-BRANCH"
+                      FAIL=$((FAIL + 1))
+                      continue
+                    fi
+
+                    current_branch=$(git -C "$repo_dir" branch --show-current 2>/dev/null)
+                    if [ -n "$current_branch" ] && [ "$current_branch" != "$default_branch" ]; then
+                      # -f discards any stray worktree changes left by debug sessions.
+                      git -C "$repo_dir" checkout -f -q "$default_branch" 2>/dev/null || true
+                    fi
+
+                    # Check the return code — a failed reset (e.g. missing
+                    # origin/<default>) must NOT be masked as OK.
+                    if git -C "$repo_dir" reset --hard "origin/$default_branch" --quiet 2>/dev/null; then
+                      echo "OK ($default_branch)"
                       SUCCESS=$((SUCCESS + 1))
                     else
-                      echo "FAILED"
+                      echo "RESET-FAILED ($default_branch)"
                       FAIL=$((FAIL + 1))
                     fi
                   done
