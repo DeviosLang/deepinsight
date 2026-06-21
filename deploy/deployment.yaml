@@ -32,7 +32,12 @@ spec:
       # work and surfaces "orphaned by service restart" to the caller.
       # The Deployment's readinessProbe also stops sending new requests
       # to a terminating Pod, so it'll drain naturally during this window.
-      terminationGracePeriodSeconds: 900
+      #
+      # Was 900s because the app ignored SIGTERM and idled the full window.
+      # Now index.ts traps SIGTERM → aborts in-flight pi children, drains
+      # queued/running tasks to "failed" on disk, and exits within ~30s.
+      # 60s gives comfortable margin over the 30s soft-timeout in app code.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: server
           image: mirrors.tencent.com/cvm/deepinsight:latest

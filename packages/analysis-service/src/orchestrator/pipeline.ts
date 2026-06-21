@@ -223,6 +223,7 @@ export function loadPipelineConfig(): PipelineConfig {
 export async function runAnalysisPipeline(
   task: AnalysisTask,
   config: PipelineConfig,
+  signal?: AbortSignal,
 ): Promise<AnalysisResult | null> {
   const traceCtx = startTrace(task);
   const repoManager = new RepoManager({
@@ -239,7 +240,7 @@ export async function runAnalysisPipeline(
 
   // Single change — run directly
   if (task.changes.length === 1) {
-    const { result, piResult } = await runSingleChange(task, task.changes[0], config, repoManager, traceCtx);
+    const { result, piResult } = await runSingleChange(task, task.changes[0], config, repoManager, traceCtx, signal);
     flushTrace(traceCtx, task, piResult ?? undefined).catch(() => {});
     return result;
   }
@@ -404,7 +405,7 @@ export async function runAnalysisPipeline(
     // run (typical case: one change drives the analysis, others are tiny).
     let lastPiResult: PiWorkerResult | null = null;
     for (const rc of resolvedChanges) {
-      const { result, piResult } = await runSingleChange(task, rc.change, config, repoManager, traceCtx);
+      const { result, piResult } = await runSingleChange(task, rc.change, config, repoManager, traceCtx, signal);
       results.push(result);
       if (piResult) lastPiResult = piResult;
     }
@@ -589,14 +590,14 @@ export async function runAnalysisPipeline(
       // Each worker sees ALL diffs (for cross-repo reasoning) but focuses on its symbol subset
       const prompt = buildAnalysisPrompt({ ...commonPromptParams, diff: combinedDiff });
       console.log(`[pipeline:${task.taskId}] Step 4: Worker ${i + 1}/${groups.length} — symbols: ${group.map(s => s.name).join(', ')}`);
-      return runPiWorkerWithRetry(prompt, piConfig);
+      return runPiWorkerWithRetry(prompt, piConfig, signal);
     });
     const results = await Promise.allSettled(workerPromises);
     piResult = mergeParallelPiResults(results);
   } else {
     const prompt = buildAnalysisPrompt({ ...commonPromptParams, diff: combinedDiff });
     console.log(`[pipeline:${task.taskId}] Step 4: Joint single worker — ${allSymbols.length} symbols, prompt ${prompt.length} chars`);
-    piResult = await runPiWorkerWithRetry(prompt, piConfig);
+    piResult = await runPiWorkerWithRetry(prompt, piConfig, signal);
   }
 
   if (piResult.success) { recordLlmSuccess(); } else { recordLlmFailure(); }
@@ -657,6 +658,7 @@ async function runSingleChange(
   config: PipelineConfig,
   repoManager: RepoManager,
   traceCtx: ReturnType<typeof startTrace>,
+  signal?: AbortSignal,
 ): Promise<{ result: AnalysisResult | null; piResult: PiWorkerResult | null }> {
   // ─── Step 0: Resolve branch reference ───────────────────────────────────────
   if (change.branch && !change.commit) {
@@ -908,7 +910,7 @@ async function runSingleChange(
           diff: groupDiff || diff, // fallback to full diff if filter fails
         });
         console.log(`[pipeline:${task.taskId}] Step 4: Worker ${i + 1}/${groups.length} — symbols: ${group.map((s) => s.name).join(", ")} (prompt: ${prompt.length} chars)`);
-        return runPiWorkerWithRetry(prompt, piConfig);
+        return runPiWorkerWithRetry(prompt, piConfig, signal);
       });
 
       const results = await Promise.allSettled(workerPromises);
@@ -924,7 +926,7 @@ async function runSingleChange(
       // ─── Single worker mode (≤ 2 symbols) ─────────────────────────────────
       const prompt = buildAnalysisPrompt({ ...commonPromptParams, diff });
       console.log(`[pipeline:${task.taskId}] Step 4: Single worker — ${symbols.length} symbols (prompt: ${prompt.length} chars)`);
-      piResult = await runPiWorkerWithRetry(prompt, piConfig);
+      piResult = await runPiWorkerWithRetry(prompt, piConfig, signal);
 
       if (piResult.success) {
         recordLlmSuccess();

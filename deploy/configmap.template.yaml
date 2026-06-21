@@ -27,16 +27,6 @@ data:
       # ... add more repos. The pipeline reads each repo's `role` directly:
       #   entry_point → [ENTRY], sink → [SINK], shared_lib/core/service → ordinary.
 
-    llm:
-      analysis:
-        base_url: "<LLM_BASE_URL>"
-        api_key_env: "LLM_ANALYSIS_API_KEY"
-        model: "deepseek-v4-pro"
-      utility:
-        base_url: "<LLM_BASE_URL>"
-        api_key_env: "LLM_UTILITY_API_KEY"
-        model: "deepseek-v4-pro"
-
     risk_patterns:
       high_risk_dirs:
         - "*/auth/*"

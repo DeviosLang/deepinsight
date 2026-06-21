@@ -57,6 +57,49 @@ function releaseSlot(): void {
 
 console.log(`[concurrency] MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS}`);
 
+// ─── Graceful shutdown ─────────────────────────────────────────────────────
+// Shared AbortController fired on SIGTERM. Threads through startAnalysis →
+// runAnalysisPipeline → runPiWorker so the spawned pi child processes are
+// killed promptly instead of orphaned to consume the full grace period.
+const shutdownController = new AbortController();
+
+/** True once shutdown has begun — gates new task admission. */
+let shuttingDown = false;
+
+/**
+ * Mark every in-flight (queued/running) task as failed on disk so polling
+ * clients see an immediate, honest status instead of waiting up to 60 min
+ * for the orphan-recovery sweep on the next Pod's startup.
+ *
+ * Safe to call multiple times — only touches tasks without a completedAt.
+ */
+function drainInFlightTasks(reason: string): void {
+  let drained = 0;
+  for (const task of tasks.values()) {
+    if (task.status === "queued" || task.status === "running") {
+      task.status = "failed";
+      task.error = task.error ?? reason;
+      task.completedAt = task.completedAt ?? new Date().toISOString();
+      persistTask(task);
+      drained++;
+    }
+  }
+  console.log(`[shutdown] Drained ${drained} in-flight task(s): ${reason}`);
+}
+
+/** Exposed for index.ts to wire into process signals. */
+export function initiateShutdown(reason: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[shutdown] Initiating: ${reason}`);
+  shutdownController.abort();
+  drainInFlightTasks(reason);
+}
+
+export function isShuttingDown(): boolean {
+  return shuttingDown;
+}
+
 /** Initialize: load existing tasks from disk, clean up expired ones */
 function loadTasksFromDisk(): void {
   try {
@@ -410,6 +453,12 @@ export async function analyzeRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: "project and changes are required" });
     }
 
+    // Refuse new work while draining — accepting it would just queue a task
+    // that gets immediately failed on the next shutdown sweep.
+    if (shuttingDown) {
+      return reply.status(503).send({ error: "service is shutting down" });
+    }
+
     // Normalize repo fields: accept full HTTP(S) URLs as well as bare names.
     const normalizedChanges = changes.map((c) => ({ ...c, repo: normalizeRepo(c.repo) }));
     const normalizedOptions = options ?? {};
@@ -666,7 +715,25 @@ async function startAnalysis(task: AnalysisTask, pipelineConfig: ReturnType<type
     task.progress = { step: 0, stepName: "初始化", reposScanned: 0, reposTotal: 0 };
     persistTask(task);
 
-    const result = await runAnalysisPipeline(task, pipelineConfig);
+    let result: Awaited<ReturnType<typeof runAnalysisPipeline>> | null = null;
+    try {
+      result = await runAnalysisPipeline(task, pipelineConfig, shutdownController.signal);
+    } catch (err) {
+      // AbortSignal fires during shutdown — pi children are killed and the
+      // pipeline rejects. Surface an honest, retryable error rather than a
+      // generic "no result". dedup already skips failed tasks, so callers
+      // can re-POST immediately.
+      const aborted = shutdownController.signal.aborted
+        || (err instanceof Error && err.name === "AbortError");
+      if (aborted) {
+        task.status = "failed";
+        task.error = task.error ?? "服务重启，任务中断，请重试";
+        task.completedAt = new Date().toISOString();
+        persistTask(task);
+        return;
+      }
+      throw err;
+    }
 
     if (result) {
       task.result = result;

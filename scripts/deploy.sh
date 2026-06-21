@@ -54,10 +54,31 @@ if [[ "${MODE}" == "full" || "${MODE}" == "restart" ]]; then
   kubectl rollout restart deployment/${DEPLOYMENT} -n "${NAMESPACE}"
 
   echo "▶ [3] Waiting for rollout to complete..."
-  kubectl rollout status deployment/${DEPLOYMENT} -n "${NAMESPACE}" --timeout=300s
+  # Don't rely on `kubectl rollout status --watch` alone — its underlying watch
+  # stream intermittently stalls with "event bookmark expired" and then times
+  # out even when pods are already healthy (observed repeatedly on this cluster).
+  # Poll the deployment's status fields directly as the source of truth.
+  ROLLOUT_OK=false
+  for i in $(seq 1 60); do
+    sleep 5
+    DESIRED=$(kubectl get deploy "${DEPLOYMENT}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo 0)
+    UPDATED=$(kubectl get deploy "${DEPLOYMENT}" -n "${NAMESPACE}" -o jsonpath='{.status.updatedReplicas}' 2>/dev/null || echo 0)
+    READY=$(kubectl get deploy "${DEPLOYMENT}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+    AVAIL=$(kubectl get deploy "${DEPLOYMENT}" -n "${NAMESPACE}" -o jsonpath='{.status.availableReplicas}' 2>/dev/null || echo 0)
+    if [[ "${DESIRED}" != "0" && "${UPDATED}" == "${DESIRED}" && "${READY}" == "${DESIRED}" && "${AVAIL}" == "${DESIRED}" ]]; then
+      ROLLOUT_OK=true
+      break
+    fi
+    echo "   [${i}] updated=${UPDATED}/${DESIRED} ready=${READY}/${DESIRED} available=${AVAIL}/${DESIRED}"
+  done
 
-  echo ""
-  echo "✓ Rollout complete"
+  if $ROLLOUT_OK; then
+    echo "✓ Rollout complete"
+  else
+    echo "⚠ Rollout not confirmed as healthy after 5 min — check pod status below."
+    echo "  (Common cause: a pod stuck ContainerCreating due to CNI IP exhaustion on a node —"
+    echo "   force-delete it so the scheduler reschedules elsewhere.)"
+  fi
 fi
 
 # ─── Step 3: Verify ─────────────────────────────────────────────────────────
@@ -72,8 +93,14 @@ echo "  Deploy complete!"
 echo ""
 echo "  验证命令:"
 echo "    kubectl -n ${NAMESPACE} logs deploy/${DEPLOYMENT} --tail=20"
-echo "    kubectl -n ${NAMESPACE} exec deploy/${DEPLOYMENT} -- curl -s localhost:8080/healthz"
+echo "    kubectl -n ${NAMESPACE} exec deploy/${DEPLOYMENT} -- node -e \"require('http').get('http://localhost:8080/healthz',r=>{let d='';r.on('data',c=>d+=c);r.on('end',()=>console.log(r.statusCode,d))})\""
 echo ""
 echo "  首次运行 indexer 生成 AGENTS.md:"
 echo "    kubectl -n ${NAMESPACE} exec deploy/${DEPLOYMENT} -- npx tsx packages/indexer/src/generate-layer1.ts --workspace /data/workspace"
+echo ""
+echo "  ⚠ 改 Secret 后的部署:"
+echo "    Secret 不在本脚本 apply 范围内（模板不含真实值）。改 Secret 后必须"
+echo "    重启 Pod 才能生效:"
+echo "      ./scripts/deploy.sh --restart-only    # 或 kubectl rollout restart"
+echo "    用 --apply-only 不会重新加载 Secret 值。"
 echo "══════════════════════════════════════════════════"
