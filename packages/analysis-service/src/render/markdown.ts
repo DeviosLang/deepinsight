@@ -131,6 +131,7 @@ export function renderMarkdown(
 
   const sections: string[] = [];
   sections.push(renderHeader(task, result));
+  sections.push(renderFallbackBanner(result, task));
   sections.push(renderSummary(result));
 
   const checklist = renderActionChecklist(result);
@@ -729,6 +730,9 @@ function renderCallChainMermaid(result: Unknown): string {
   }
 
   const allNodes: FlatNode[] = [];
+  // Global counter ensures node ids stay unique even after safeMermaidId()
+  // truncates long names to 60 chars (the counter lives at the prefix).
+  let globalNodeIdCounter = 0;
   // Map from symbol name → Mermaid root node id
   const rootIds = new Map<string, string>();
 
@@ -755,7 +759,10 @@ function renderCallChainMermaid(result: Unknown): string {
       // colour by whichever is present.
       const risk = String(pick(node, "priority", "risk") ?? "");
 
-      const id = safeMermaidId(`n_${symName}_${i}_${fn}`);
+      // Use a global counter at the start of the id so slice(0,60) truncation
+      // can't collapse distinct nodes into the same id (avoids dedup of
+      // repeated callers like multiple RunInstances entry nodes).
+      const id = safeMermaidId(`n${globalNodeIdCounter++}_${symName}_${fn}`);
       // Parent = closest ancestor at depth-1; fall back to root if not found.
       const parentId = depthStack.get(depth - 1) ?? rootId;
 
@@ -790,7 +797,7 @@ function renderCallChainMermaid(result: Unknown): string {
     const symName = String(sym.name ?? "symbol");
     const rootId = rootIds.get(symName)!;
     const location = String(sym.location ?? "");
-    const label = location ? `${symName}<br/><small>${escapeQuote(location)}</small>` : symName;
+    const label = location ? `✏️ ${symName}<br/><small>${escapeQuote(location)}</small>` : `✏️ ${symName}`;
     lines.push(`  ${rootId}["${label}"]:::changed`);
   }
 
@@ -804,7 +811,9 @@ function renderCallChainMermaid(result: Unknown): string {
       lines.push(`  ${n.id}["${label}"]${cls ? `:::${cls}` : ""}`);
       declaredIds.add(n.id);
     }
-    lines.push(`  ${n.parentId} --> ${n.id}`);
+    // Arrow direction = caller --> callee, so the flow reads top-down:
+    // entry API at top, changed function at the bottom of each chain.
+    lines.push(`  ${n.id} --> ${n.parentId}`);
   }
 
   // Class definitions.
@@ -816,7 +825,7 @@ function renderCallChainMermaid(result: Unknown): string {
 
   lines.push("```");
   lines.push("");
-  lines.push("_橙色节点为本次改动的函数；箭头方向为调用方 → 被调用方。_");
+  lines.push("_✏️ 橙色节点为本次改动的函数；箭头方向为调用方 → 被调用方（自上而下调用链）。_");
 
   return lines.join("\n");
 }
@@ -852,6 +861,29 @@ function renderGlobalPatterns(result: Unknown): string {
   const lines: string[] = [`## 🔁 历史风险模式匹配 (${items.length})`];
   lines.push("");
   for (const item of items) lines.push(`- ${String(item)}`);
+  return lines.join("\n");
+}
+
+// ─── Fallback banner (LLM produced no valid report) ────────────────────────
+
+function renderFallbackBanner(result: Unknown, task: Unknown): string {
+  if (result._fallback !== true) return "";
+  const reason = String(result._fallbackReason ?? "LLM 未产出有效报告");
+  const status = String(task.status ?? "failed");
+  const lines: string[] = [`## ⚠️ 降级输出（分析未成功）`];
+  lines.push("");
+  lines.push(
+    `> 本次分析**未能生成有效报告**（status: \`${status}\`）。下方内容为 fallback 骨架，`,
+  );
+  lines.push(
+    `> 符号的 \`call_tree\` / \`risk_table\` / \`downstream_contracts\` 均为空，**不代表真实风险结论**。`,
+  );
+  lines.push(">");
+  lines.push(`> 原因：${reason}`);
+  lines.push(">");
+  lines.push(
+    "> 建议：检查 LLM 后端可用性 / 配额后重新触发分析；原始输出见文末「原始输出」小节。",
+  );
   return lines.join("\n");
 }
 

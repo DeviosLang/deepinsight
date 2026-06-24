@@ -413,6 +413,20 @@ export async function runAnalysisPipeline(
     if (validResults.length === 0) return null;
     const merged = validResults.length === 1 ? validResults[0] : mergeMultiChangeResults(validResults);
 
+    // If EVERY per-repo result is a fallback skeleton, the merged artifact is
+    // also effectively a fallback (no repo produced a real report). Propagate
+    // the `_fallback` tag so the API layer marks the task `failed` instead of
+    // `completed`. A partial success (some repos real, some fallback) stays
+    // `completed` — the merged result carries real data from the winners.
+    const allFallback = validResults.every(
+      (r) => (r as unknown as Record<string, unknown>)._fallback === true,
+    );
+    if (allFallback) {
+      (merged as unknown as Record<string, unknown>)._fallback = true;
+      (merged as unknown as Record<string, unknown>)._fallbackReason =
+        `独立模式：全部 ${validResults.length} 个仓库均未产出有效 JSON 报告`;
+    }
+
     // Aggregate per-repo schemaLint summaries into the merged result's _meta.
     // mergeMultiChangeResults only combines business fields; _meta is dropped.
     // Re-aggregate here so the merged result carries the full drift picture.
@@ -629,7 +643,12 @@ export async function runAnalysisPipeline(
 
   // Fallback — emit a minimal cross-repo-impact/2.0 skeleton so downstream
   // consumers don't crash on missing schema_version. The renderer treats
-  // _rawOutput as the partial-output banner.
+  // _rawOutput as the partial-output banner. Tagged `_fallback` so the API
+  // layer reports `failed` (LLM produced no valid report) rather than
+  // `completed`.
+  console.warn(
+    `[pipeline:${task.taskId}] Step 5: Joint analysis produced no valid JSON (${piOutput.length} chars) — returning fallback artifact. Reason: ${describeValidationFailure(jsonResult)}`,
+  );
   flushTrace(traceCtx, task, piResult).catch(() => {});
   return buildFallbackArtifact({
     changes: resolvedChanges.map((rc) => rc.change),
@@ -640,6 +659,7 @@ export async function runAnalysisPipeline(
       initial_severity: "medium" as const,
     })),
     rawOutput: piOutput,
+    reason: "联合分析：LLM 未产出有效的 cross-repo-impact JSON 报告",
   }) as unknown as AnalysisResult;
 }
 
@@ -999,6 +1019,7 @@ async function runSingleChange(
         initial_severity: "medium" as const,
       })),
       rawOutput: piOutput,
+      reason: `单仓分析(${change.repo})：LLM 未产出有效的 cross-repo-impact JSON 报告`,
     }) as unknown as AnalysisResult,
     piResult,
   };
@@ -1249,14 +1270,22 @@ function truncateRawOutput(output: string): string {
  * Build a minimal cross-repo-impact/2.0 fallback artifact when pi fails to
  * emit valid JSON. Contains stub symbols (no call_tree / risk_table) plus a
  * `_rawOutput` tail so the renderer can show the partial pi text.
+ *
+ * The artifact is tagged `_fallback: true` (with a human-readable
+ * `_fallbackReason`) so the API layer can flip `task.status` to "failed"
+ * instead of masking an LLM outage as "completed". The partial artifact is
+ * still attached to `task.result` for debugging (raw output, stub symbols).
  */
 function buildFallbackArtifact(params: {
   changes: ChangeSpec[];
   symbols: Array<{ name: string; location: string; diff_semantic: string; initial_severity: "high" | "medium" | "low" }>;
   rawOutput: string;
+  reason: string;
 }): Record<string, unknown> {
   return {
     schema_version: "cross-repo-impact/2.0",
+    _fallback: true,
+    _fallbackReason: params.reason,
     meta: {
       tool_name: "deepinsight-pipeline",
       tool_version: "2.0",

@@ -535,4 +535,28 @@ describe("renderMarkdown (cross-repo-impact/2.0)", () => {
     expect(md).toContain("## 🪵 原始输出 (JSON 解析失败)");
     expect(md).toContain("some raw pi text");
   });
+
+  test("_fallback artifact renders a degraded-output banner warning the report is not a real risk conclusion", () => {
+    const md = renderMarkdown({
+      status: "failed",
+      taskId: "analysis-fallback-1",
+      result: {
+        schema_version: "cross-repo-impact/2.0",
+        _fallback: true,
+        _fallbackReason: "联合分析：LLM 未产出有效的 cross-repo-impact JSON 报告",
+        symbols: [
+          { id: "SYM-001", name: "foo", call_tree: [], risk_table: [], downstream_contracts: [] },
+        ],
+        test_scenarios: [],
+        unanalyzable: [],
+        _rawOutput: "\n---\n\n---\n",
+      },
+    });
+    // The degraded banner must appear and make clear this is NOT a real report.
+    expect(md).toContain("降级输出");
+    expect(md).toContain("未能生成有效报告");
+    expect(md).toContain("不代表真实风险结论");
+    // The reason should surface.
+    expect(md).toContain("LLM 未产出有效的 cross-repo-impact JSON 报告");
+  });
 });

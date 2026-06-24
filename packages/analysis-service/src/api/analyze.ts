@@ -736,13 +736,31 @@ async function startAnalysis(task: AnalysisTask, pipelineConfig: ReturnType<type
     }
 
     if (result) {
+      // The pipeline returns a non-null result on BOTH success and the
+      // fallback-skeleton path. A fallback artifact is tagged `_fallback`
+      // (LLM produced no valid JSON report) — surface it as `failed` with a
+      // descriptive error so polling clients don't mistake an LLM outage for
+      // a completed analysis. We still attach `task.result` so the partial
+      // artifact (stub symbols, _rawOutput) stays retrievable for debugging.
+      const isFallback = (result as unknown as Record<string, unknown>)._fallback === true;
       task.result = result;
-      task.status = "completed";
+      if (isFallback) {
+        task.status = "failed";
+        task.error =
+          ((result as unknown as Record<string, unknown>)._fallbackReason as string) ??
+          "LLM 未产出有效报告（fallback 降级）";
+        task.progress = { ...task.progress, stepName: "分析失败" };
+      } else {
+        task.status = "completed";
+        task.progress = { ...task.progress, stepName: "分析完成" };
+      }
     } else if (!task.error) {
       task.status = "failed";
       task.error = "Analysis returned no result";
+      task.progress = { ...task.progress, stepName: "分析失败" };
     } else {
       task.status = "failed";
+      task.progress = { ...task.progress, stepName: "分析失败" };
     }
 
     task.completedAt = new Date().toISOString();
