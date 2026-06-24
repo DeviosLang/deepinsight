@@ -17,7 +17,7 @@ deploy/.secrets/
 .idea/
 *.swp
 *.swo
-
+.mcp.json
 # OS
 .DS_Store
 Thumbs.db
